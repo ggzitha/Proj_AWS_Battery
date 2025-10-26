@@ -128,8 +128,8 @@ void loop() {
 
       char dataBuffer[64];
       snprintf(dataBuffer, sizeof(dataBuffer),
-               "t=%.2f,a=%.2f,v=%.2f,h=%.2f",
-               readings.temperature, readings.current, readings.voltage, readings.humidity);
+               "v=%.2f,a=%.2f,t=%.2f,h=%.2f",
+               readings.voltage, readings.current, readings.temperature, readings.humidity);
       pDataCharacteristic->setValue(dataBuffer);
       pDataCharacteristic->notify();
     }
