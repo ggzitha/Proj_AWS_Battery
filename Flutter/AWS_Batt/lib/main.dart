@@ -355,16 +355,18 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   // ---------- NEW: token extraction & parsing helpers ----------
 
   /// Extract all k=v numeric tokens in one pass. Keeps the first seen value per key.
+  /// Accepts "12." and normalizes it to "12.0".
   Map<String, String> _extractRawTokens(String raw) {
     final rx = RegExp(
-      r'\b([a-zA-Z]+)\s*=\s*(-?\d+(?:\.\d+)?)\b',
+      r'\b([a-zA-Z]+)\s*=\s*(-?\d+(?:\.\d*)?)\b', // allow optional digits after '.'
       caseSensitive: false,
     );
     final out = <String, String>{};
     for (final m in rx.allMatches(raw)) {
       final k = m.group(1)!.toLowerCase();
-      final v = m.group(2)!; // exact numeric like "12.49"
-      out.putIfAbsent(k, () => v); // do NOT overwrite
+      var v = m.group(2)!.trim(); // exact numeric text like '12.' or '12.49'
+      if (v.endsWith('.')) v = '${v}0'; // normalize '12.' -> '12.0'
+      out.putIfAbsent(k, () => v); // keep first seen; don't overwrite
     }
     return out;
   }
@@ -414,6 +416,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
             .trim();
 
         ds.lastRaw = raw;
+        print(
+            "RAW: $raw  |  rawV=${ds.lastRawVoltx} parsedV=${ds.last?.voltx}");
 
         // Single-pass tokenization
         final toks = _extractRawTokens(raw);
