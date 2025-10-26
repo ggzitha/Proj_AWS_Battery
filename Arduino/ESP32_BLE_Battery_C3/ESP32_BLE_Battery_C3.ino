@@ -4,8 +4,8 @@
 #include <BLE2902.h>
 
 // --- CONFIGURATION ---
-// CHANGE THIS NUMBER FOR EACH ESP32 BEFORE UPLOADING
-#define DEVICE_NUM 5 // Set this to 4, 5, or 6
+// CHANGE THIS NUMBER FOR EACH ESP32-C3 BEFORE UPLOADING
+#define DEVICE_NUM 4 // Set this to 4, 5, or 6
 // --------------------
 
 // UUIDs for the Service and Characteristic
@@ -17,7 +17,9 @@ BLEServer* pServer = NULL;
 BLECharacteristic* pDataCharacteristic = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
-char bleDeviceName[32]; // Buffer to hold the dynamic device name
+
+// Use a String object for the device name
+String bleDeviceName;
 
 // Callback class for handling server connection events
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -34,18 +36,15 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting BLE Multi-Parameter Sensor!");
+  Serial.println("Starting BLE work!");
 
-  // Seed the random number generator
-  randomSeed(analogRead(A0));
-
-  // Create the dynamic BLE device name
-  snprintf(bleDeviceName, sizeof(bleDeviceName), "BATT-Mon_%d", DEVICE_NUM);
+  // Build the device name using String concatenation
+  bleDeviceName = "BATT-Mon_" + String(DEVICE_NUM);
   Serial.print("BLE Device Name: ");
   Serial.println(bleDeviceName);
 
-  // Create the BLE Device
-  BLEDevice::init(bleDeviceName);
+  // Initialize the BLE device with the generated name
+  BLEDevice::init(bleDeviceName.c_str());
 
   // Create the BLE Server
   pServer = BLEDevice::createServer();
@@ -67,13 +66,15 @@ void setup() {
   // Start the service
   pService->start();
 
-  // Start advertising
+  // --- ADVERTISING SETUP (based on your example) ---
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);
+  pAdvertising->setScanResponse(true);
+  // These functions help with iPhone connections issue
+  pAdvertising->setMinPreferred(0x06);  
+  pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
-  Serial.println("Waiting for a client connection to notify...");
+  Serial.println("Characteristic defined! Device is now advertising.");
 }
 
 void loop() {

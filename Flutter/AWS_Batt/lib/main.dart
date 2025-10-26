@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math';
+import 'dart:ui' show FontFeature; // needed for FontFeature.tabularFigures
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
@@ -21,7 +22,7 @@ void main() {
 
 /// BLE UUIDs — final (not const)
 final Uuid kServiceUuid = Uuid.parse("91bad492-b950-4226-aa2b-4ede9fa42f59");
-final Uuid kCharUuid    = Uuid.parse("cba1d466-344c-4be3-ab3f-189daa0a16d8");
+final Uuid kCharUuid = Uuid.parse("cba1d466-344c-4be3-ab3f-189daa0a16d8");
 
 /// Target device names (no MAC hardcoding)
 const targetNames = {
@@ -43,7 +44,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: "Mee_BAT Monitor",
-      themeMode: ThemeMode.system, // follow device setting
+      themeMode: ThemeMode.system,
       theme: ThemeData(
         colorSchemeSeed: Colors.teal,
         useMaterial3: true,
@@ -61,11 +62,11 @@ class MyApp extends StatelessWidget {
 
 class ParsedReading {
   final DateTime ts;
-  final double v;
-  final double a;
-  final double t;
-  double get watt => v * a;
-  ParsedReading(this.ts, this.v, this.a, this.t);
+  final double voltx; // Voltage
+  final double ampx; // Current (positive = charging, negative = discharging)
+  final double tempx; // Temperature
+  double get watt => voltx * ampx;
+  ParsedReading(this.ts, this.voltx, this.ampx, this.tempx);
 }
 
 /// Sliding window by time (keeps 10 minutes)
@@ -95,13 +96,13 @@ class TimeSeries {
 
 /// Estimation bundle
 class Estimate {
-  final bool charging;        // true if slope positive
-  final double socNow;        // 0..100
-  final Duration? toEmpty;    // if discharging
-  final Duration? toFull;     // if charging
+  final bool charging; // true if ampx > 0
+  final double socNow; // 0..100
+  final Duration? toEmpty; // if discharging
+  final Duration? toFull; // if charging
   final DateTime calcTime;
   final List<FlSpot> futureSeries; // projected SoC vs time
-  final List<FlSpot> pastSeries;   // recent SoC history
+  final List<FlSpot> pastSeries; // recent SoC history
   Estimate({
     required this.charging,
     required this.socNow,
@@ -129,9 +130,15 @@ class DeviceState {
   DateTime? _lastSocTs;
 
   // SoC instantaneous history (cap to ~10min @ 2s ≈ 300)
-  final List<MapEntry<DateTime,double>> socHist = [];
+  final List<MapEntry<DateTime, double>> socHist = [];
   int _lastEstimateLen = 0;
   Estimate? estimate;
+
+  // RAW capture (for display without any rounding)
+  String? lastRaw; // whole frame
+  String? lastRawVoltx; // 'voltx=' (or legacy 'v=')
+  String? lastRawAmpx; // 'ampx=' (or legacy 'a=')
+  String? lastRawTempx; // 'tempx=' (or legacy 't=')
 
   DeviceState(this.device);
 
@@ -171,7 +178,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   // SoC smoothing params
   static const double _emaAlphaCharge = 0.15; // smoother while charging
   static const double _emaAlphaDischarge = 0.25; // snappier when unplugged
-  static const double _chargeAmpThreshold = 0.10; // >0.1A => charging
 
   @override
   void initState() {
@@ -199,7 +205,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _rCellMilliOhm = sp.getDouble(_kRcellMilliOhmKey) ?? 38.0;
 
       if (!(_vMin < _vNom && _vNom < _vMax)) {
-        _vMax = 4.20; _vNom = 3.60; _vMin = 2.80;
+        _vMax = 4.20;
+        _vNom = 3.60;
+        _vMin = 2.80;
       }
       if (_rCellMilliOhm < 0) _rCellMilliOhm = 38.0;
     });
@@ -246,7 +254,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   void _startScan() {
-    // Debounce/cooldown guard
     final now = DateTime.now();
     if (now.isBefore(_nextAllowedScan)) {
       final waitMs = _nextAllowedScan.difference(now).inMilliseconds;
@@ -265,9 +272,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _scanSub = null;
 
     try {
-      _scanSub = _ble
-          .scanForDevices(withServices: const [], scanMode: ScanMode.lowLatency)
-          .listen((d) {
+      _scanSub = _ble.scanForDevices(
+          withServices: const [], scanMode: ScanMode.lowLatency).listen((d) {
         if (!targetNames.contains(d.name)) return;
 
         if (!_devices.containsKey(d.id)) {
@@ -313,10 +319,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     ds.error = null;
     ds.connSub?.cancel();
 
-    ds.connSub = _ble.connectToDevice(
+    ds.connSub = _ble
+        .connectToDevice(
       id: ds.device.id,
       connectionTimeout: const Duration(seconds: 10),
-    ).listen((update) {
+    )
+        .listen((update) {
       if (!mounted) return;
       switch (update.connectionState) {
         case DeviceConnectionState.connected:
@@ -344,6 +352,51 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     });
   }
 
+  // ---------- NEW: token extraction & parsing helpers ----------
+
+  /// Extract all k=v numeric tokens in one pass. Keeps the first seen value per key.
+  Map<String, String> _extractRawTokens(String raw) {
+    final rx = RegExp(
+      r'\b([a-zA-Z]+)\s*=\s*(-?\d+(?:\.\d+)?)\b',
+      caseSensitive: false,
+    );
+    final out = <String, String>{};
+    for (final m in rx.allMatches(raw)) {
+      final k = m.group(1)!.toLowerCase();
+      final v = m.group(2)!; // exact numeric like "12.49"
+      out.putIfAbsent(k, () => v); // do NOT overwrite
+    }
+    return out;
+  }
+
+  /// Priority parse from token map; never overwrites earlier (preferred) keys.
+  ParsedReading _parsePayloadFromTokens(Map<String, String> toks) {
+    double? _pickD(List<String> keys) {
+      for (final k in keys) {
+        final s = toks[k];
+        if (s == null) continue;
+        final d = double.tryParse(s);
+        if (d != null) return d;
+      }
+      return null;
+    }
+
+    final voltx = _pickD(['voltx', 'voltage', 'v']);
+    final ampx = _pickD(['ampx', 'ampere', 'a']);
+    final tempx = _pickD(['tempx', 'temperature', 't']);
+
+    if (tempx == null || ampx == null || voltx == null) {
+      throw FormatException("Data tidak Valid (token hilang): $toks");
+    }
+    return ParsedReading(DateTime.now(), voltx, ampx, tempx);
+  }
+
+  // Back-compat wrapper (unused elsewhere, but handy if needed)
+  ParsedReading _parsePayload(String s) =>
+      _parsePayloadFromTokens(_extractRawTokens(s));
+
+  // ------------------------------------------------------------
+
   void _subscribe(DeviceState ds) {
     ds.notifySub?.cancel();
 
@@ -355,16 +408,35 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
     ds.notifySub = _ble.subscribeToCharacteristic(ch).listen((data) {
       try {
-        final reading = _parsePayload(data);
+        // RAW frame (sanitized but not modified)
+        final raw = String.fromCharCodes(data)
+            .replaceAll(RegExp(r'[\x00-\x1F]'), ' ')
+            .trim();
+
+        ds.lastRaw = raw;
+
+        // Single-pass tokenization
+        final toks = _extractRawTokens(raw);
+
+        // Keep exact text for display (prefer long keys)
+        ds.lastRawVoltx = toks['voltx'] ?? toks['voltage'] ?? toks['v'];
+        ds.lastRawAmpx = toks['ampx'] ?? toks['ampere'] ?? toks['a'];
+        ds.lastRawTempx = toks['tempx'] ?? toks['temperature'] ?? toks['t'];
+
+        // Numeric parsing (for charts/math) — no overwrite of priority
+        final reading = _parsePayloadFromTokens(toks);
         ds.last = reading;
         ds.history.add(reading);
 
-        // Update SoC (EMA untuk battery bar)
+        // Charge/discharge logic - positive ampx = charging, negative = discharging
+        final isCharging = reading.ampx > 0.0;
+
+        // Update SoC — choose alpha by charging state
         final socInstant = _socPercent(reading);
         ds._socPctEma = _emaNext(
           ds._socPctEma,
           socInstant,
-          reading.a > _chargeAmpThreshold ? _emaAlphaCharge : _emaAlphaDischarge,
+          (isCharging ? _emaAlphaCharge : _emaAlphaDischarge),
         );
         ds._lastSocTs = reading.ts;
 
@@ -376,7 +448,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         }
 
         // Recompute estimate tiap 5 data baru
-        if (ds.socHist.length >= 5 && (ds.socHist.length - ds._lastEstimateLen) >= 5) {
+        if (ds.socHist.length >= 5 &&
+            (ds.socHist.length - ds._lastEstimateLen) >= 5) {
           ds.estimate = _computeEstimate(ds);
           ds._lastEstimateLen = ds.socHist.length;
         }
@@ -393,7 +466,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Estimate? _computeEstimate(DeviceState ds) {
-    // Last 5 points
     final n = ds.socHist.length;
     if (n < 5) return null;
     final slice = ds.socHist.sublist(n - 5, n);
@@ -404,43 +476,55 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     final dtSec = tN.difference(t0).inMilliseconds / 1000.0;
     if (dtSec <= 1) return null;
 
-    final slope = (sN - s0) / dtSec; // % per second (+ charging, - discharging)
-    final charging = slope > 0.00001;
+    final slope = (sN - s0) / dtSec; // % per second
+    final isChargingBySign = (ds.last?.ampx ?? 0) > 0.0; // positive = charging
 
     Duration? toEmpty;
     Duration? toFull;
 
-    if (slope < -1e-6) {
-      final secondsToEmpty = (sN / (-slope)).clamp(0, 365*24*3600).toDouble();
-      toEmpty = Duration(seconds: secondsToEmpty.round());
-    } else if (slope > 1e-6) {
-      final secondsToFull = ((100.0 - sN) / slope).clamp(0, 365*24*3600).toDouble();
-      toFull = Duration(seconds: secondsToFull.round());
+    if (isChargingBySign) {
+      // Charging: slope should be positive
+      if (slope > 1e-6) {
+        final secondsToFull =
+            ((100.0 - sN) / slope).clamp(0, 365 * 24 * 3600).toDouble();
+        toFull = Duration(seconds: secondsToFull.round());
+      } else {
+        toFull = null;
+      }
+    } else {
+      // Discharging: slope should be negative
+      if (slope < -1e-6) {
+        final secondsToEmpty =
+            (sN / (-slope)).clamp(0, 365 * 24 * 3600).toDouble();
+        toEmpty = Duration(seconds: secondsToEmpty.round());
+      } else {
+        toEmpty = null;
+      }
     }
 
-    // Build past SoC series (last 10 min)
-    final past = ds.socHist.map((e) =>
-        FlSpot(e.key.millisecondsSinceEpoch.toDouble(), e.value)
-    ).toList();
+    // Past & future series
+    final past = ds.socHist
+        .map((e) => FlSpot(e.key.millisecondsSinceEpoch.toDouble(), e.value))
+        .toList();
 
-    // Build future projection (limit 6 hours)
     final now = DateTime.now();
     final List<FlSpot> future = [];
-    if (slope.abs() > 1e-6) {
-      final limitSec = 6 * 3600; // 6 hours
-      final totalSec = charging
+    if ((isChargingBySign && slope > 1e-6) ||
+        (!isChargingBySign && slope < -1e-6)) {
+      final limitSec = 6 * 3600;
+      final totalSec = isChargingBySign
           ? min(limitSec, toFull?.inSeconds ?? 0)
           : min(limitSec, toEmpty?.inSeconds ?? 0);
       for (int s = 0; s <= totalSec; s += 10) {
         final soc = (sN + slope * s).clamp(0.0, 100.0);
-        future.add(
-          FlSpot(now.add(Duration(seconds: s)).millisecondsSinceEpoch.toDouble(), soc),
-        );
+        future.add(FlSpot(
+            now.add(Duration(seconds: s)).millisecondsSinceEpoch.toDouble(),
+            soc));
       }
     }
 
     return Estimate(
-      charging: charging,
+      charging: isChargingBySign,
       socNow: sN.clamp(0.0, 100.0),
       toEmpty: toEmpty,
       toFull: toFull,
@@ -460,8 +544,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     // I*R correction (mΩ -> Ω)
     final rPerCellOhm = (_rCellMilliOhm.clamp(0, 1000)) / 1000.0;
     final rSeries = rPerCellOhm * _seriesCells;
-    final isCharging = r.a > _chargeAmpThreshold;
-    final vRestPack = isCharging ? (r.v - r.a * rSeries) : (r.v + r.a.abs() * rSeries);
+
+    // Charging when ampx > 0, discharging when ampx < 0
+    final isCharging = r.ampx > 0.0;
+    final vRestPack = isCharging
+        ? (r.voltx - r.ampx * rSeries) // Charging: subtract voltage drop
+        : (r.voltx + r.ampx.abs() * rSeries); // Discharging: add voltage drop
 
     // Per-cell resting voltage
     final vCell = (vRestPack / _seriesCells).clamp(0.0, 1000.0);
@@ -499,25 +587,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _connectAndSubscribe(ds);
   }
 
-  ParsedReading _parsePayload(List<int> bytes) {
-    final s = String.fromCharCodes(bytes).trim();
-    double? t, a, v;
-    for (final part in s.split(',')) {
-      final kv = part.split('=');
-      if (kv.length != 2) continue;
-      final key = kv[0].trim();
-      final val = double.tryParse(kv[1].trim());
-      if (val == null) continue;
-      if (key == 't') t = val;
-      if (key == 'a') a = val;
-      if (key == 'v') v = val;
-    }
-    if (t == null || a == null || v == null) {
-      throw FormatException("Data tidak Valid '$s'");
-    }
-    return ParsedReading(DateTime.now(), v, a, t);
-  }
-
   void _snack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
@@ -527,7 +596,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     final vmaxCtl = TextEditingController(text: _vMax.toStringAsFixed(2));
     final vnomCtl = TextEditingController(text: _vNom.toStringAsFixed(2));
     final vminCtl = TextEditingController(text: _vMin.toStringAsFixed(2));
-    final rCellCtl = TextEditingController(text: _rCellMilliOhm.toStringAsFixed(1));
+    final rCellCtl =
+        TextEditingController(text: _rCellMilliOhm.toStringAsFixed(1));
     int seriesTmp = _seriesCells;
 
     showModalBottomSheet(
@@ -543,13 +613,16 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         builder: (_, controller) => SingleChildScrollView(
           controller: controller,
           padding: EdgeInsets.only(
-            left: 16, right: 16, top: 8,
+            left: 16,
+            right: 16,
+            top: 8,
             bottom: 16 + MediaQuery.of(ctx).viewInsets.bottom,
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text("Pengaturan Baterai", style: Theme.of(ctx).textTheme.titleLarge),
+              Text("Pengaturan Baterai",
+                  style: Theme.of(ctx).textTheme.titleLarge),
               const SizedBox(height: 10),
               Row(
                 children: [
@@ -557,7 +630,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                   Expanded(
                     child: TextField(
                       controller: vminCtl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      keyboardType:
+                          const TextInputType.numberWithOptions(decimal: true),
                       decoration: const InputDecoration(
                         labelText: "Min-Voltage (V/cell)",
                         helperText: "Default 2.80",
@@ -569,7 +643,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                   Expanded(
                     child: TextField(
                       controller: vnomCtl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      keyboardType:
+                          const TextInputType.numberWithOptions(decimal: true),
                       decoration: const InputDecoration(
                         labelText: "Nom-Volt (V/cell)",
                         helperText: "Default 3.60",
@@ -581,7 +656,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                   Expanded(
                     child: TextField(
                       controller: vmaxCtl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      keyboardType:
+                          const TextInputType.numberWithOptions(decimal: true),
                       decoration: const InputDecoration(
                         labelText: "Max-Volt (V/cell)",
                         helperText: "Default 4.20",
@@ -607,9 +683,15 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                         child: DropdownButton<int>(
                           isExpanded: true,
                           value: seriesTmp,
-                          onChanged: (v) { if (v != null) { seriesTmp = v; (ctx as Element).markNeedsBuild(); } },
+                          onChanged: (v) {
+                            if (v != null) {
+                              seriesTmp = v;
+                              (ctx as Element).markNeedsBuild();
+                            }
+                          },
                           items: [for (int i = 1; i <= 10; i++) i]
-                              .map((e) => DropdownMenuItem(value: e, child: Text("${e}s")))
+                              .map((e) => DropdownMenuItem(
+                                  value: e, child: Text("${e}s")))
                               .toList(),
                         ),
                       ),
@@ -624,7 +706,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                   Expanded(
                     child: TextField(
                       controller: rCellCtl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      keyboardType:
+                          const TextInputType.numberWithOptions(decimal: true),
                       decoration: const InputDecoration(
                         labelText: "Resitansi Internal Baterai (mΩ)",
                         helperText: "Default 38 mΩ @ 1 kHz (0–1000)",
@@ -640,22 +723,28 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                 alignment: Alignment.centerRight,
                 child: FilledButton.icon(
                   onPressed: () {
-                    final vmax  = double.tryParse(vmaxCtl.text.trim());
-                    final vnom  = double.tryParse(vnomCtl.text.trim());
-                    final vmin  = double.tryParse(vminCtl.text.trim());
-                    final rMilli= double.tryParse(rCellCtl.text.trim());
+                    final vmax = double.tryParse(vmaxCtl.text.trim());
+                    final vnom = double.tryParse(vnomCtl.text.trim());
+                    final vmin = double.tryParse(vminCtl.text.trim());
+                    final rMilli = double.tryParse(rCellCtl.text.trim());
                     if (vmax == null || vnom == null || vmin == null) {
-                      _snack("Masukan nilai tegangan yang valid."); return;
+                      _snack("Masukan nilai tegangan yang valid.");
+                      return;
                     }
                     if (!(vmin < vnom && vnom < vmax)) {
-                      _snack("Nilai V harus : Min < Nom < Max."); return;
+                      _snack("Nilai V harus : Min < Nom < Max.");
+                      return;
                     }
                     if (rMilli == null || rMilli < 0 || rMilli > 1000) {
-                      _snack("Nilai Resitansi Tidak Valid (0–1000 mΩ)."); return;
+                      _snack("Nilai Resitansi Tidak Valid (0–1000 mΩ).");
+                      return;
                     }
                     _saveSettings(
-                      vmax: vmax, vnom: vnom, vmin: vmin,
-                      series: seriesTmp, rMilliOhm: rMilli,
+                      vmax: vmax,
+                      vnom: vnom,
+                      vmin: vmin,
+                      series: seriesTmp,
+                      rMilliOhm: rMilli,
                     );
                     Navigator.pop(ctx);
                   },
@@ -671,12 +760,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
-  // Insets helper: keep above 3-button nav; respect gesture insets lightly
+  // Insets helper
   EdgeInsets _screenInsets(BuildContext context) {
     final mq = MediaQuery.of(context);
-    final bottomNav = mq.viewPadding.bottom;           // non-zero in 3-button nav
-    final gesture  = mq.systemGestureInsets.bottom;    // gesture areas
-    final bottom   = bottomNav > 0 ? bottomNav : min(12.0, gesture);
+    final bottomNav = mq.viewPadding.bottom;
+    final gesture = mq.systemGestureInsets.bottom;
+    final bottom = bottomNav > 0 ? bottomNav : min(12.0, gesture);
     return EdgeInsets.only(
       left: max(mq.viewPadding.left, mq.systemGestureInsets.left),
       right: max(mq.viewPadding.right, mq.systemGestureInsets.right),
@@ -723,20 +812,20 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         child: devices.isEmpty
             ? const Center(child: Text("Mencari Perangkat BATT-Mon ..."))
             : ListView.builder(
-          itemCount: devices.length,
-          itemBuilder: (_, i) {
-            final ds = devices[i];
-            final soc = ds._socPctEma;
-            return _DeviceAccordion(
-              key: ValueKey(ds.device.id),
-              state: ds,
-              socPercent: soc,
-              onDisconnect: () => _disconnect(ds),
-              onReconnect: () => _reconnect(ds),
-              onWindowChanged: (v) => setState(() => ds.windowOffset = v),
-            );
-          },
-        ),
+                itemCount: devices.length,
+                itemBuilder: (_, i) {
+                  final ds = devices[i];
+                  final soc = ds._socPctEma;
+                  return _DeviceAccordion(
+                    key: ValueKey(ds.device.id),
+                    state: ds,
+                    socPercent: soc,
+                    onDisconnect: () => _disconnect(ds),
+                    onReconnect: () => _reconnect(ds),
+                    onWindowChanged: (v) => setState(() => ds.windowOffset = v),
+                  );
+                },
+              ),
       ),
     );
   }
@@ -758,22 +847,34 @@ class _DeviceAccordion extends StatelessWidget {
   final VoidCallback onReconnect;
   final ValueChanged<double> onWindowChanged;
 
-
   @override
   Widget build(BuildContext context) {
     final last = state.last;
-    final title = state.device.name.isNotEmpty ? state.device.name : state.device.id;
+    final title =
+        state.device.name.isNotEmpty ? state.device.name : state.device.id;
 
     final media = MediaQuery.of(context);
     final isPortrait = media.orientation == Orientation.portrait;
     final fullHeight = media.size.height;
-    final contentHeightPortrait = fullHeight * 0.65; //tinggi charts Panel graph
+    final contentHeightPortrait = fullHeight * 0.65;
 
-    final metricPane = _MetricPane(last: last);
-    final estimateCard = _EstimateCard(state: state); // NEW TILE/CARD
-    final chartPane = _ChartPane(state: state);       // with Est tab
+    final metricPane = KeyedSubtree(
+      key: ValueKey(
+          "metric-${state.device.id}-${state.last?.ts.millisecondsSinceEpoch ?? 0}"),
+      child: _MetricPane(
+        last: last,
+        rawVoltx: state.lastRawVoltx,
+        rawAmpx: state.lastRawAmpx,
+        rawTempx: state.lastRawTempx,
+      ),
+    );
 
-    // Time slider placed between estimate card and charts
+    final estimateCard = _EstimateCard(state: state);
+    final chartPane = KeyedSubtree(
+      key: ValueKey("chart-${state.device.id}-${state.history.items.length}"),
+      child: _ChartPane(state: state),
+    );
+
     final timeSlider = Padding(
       padding: const EdgeInsets.symmetric(vertical: 1.0),
       child: ConstrainedBox(
@@ -796,41 +897,40 @@ class _DeviceAccordion extends StatelessWidget {
       ),
     );
 
-    // Content (battery bar stays in title)
     final content = isPortrait
         ? ConstrainedBox(
-      constraints: BoxConstraints(maxHeight: contentHeightPortrait),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          metricPane,            // 2x2 tiles
-          estimateCard,          // NEW card
-          timeSlider,            // slider
-          const SizedBox(height: 4),
-          Flexible(child: chartPane),
-        ],
-      ),
-    )
-        : SizedBox(
-      height: 400,
-      child: Row(
-        children: [
-          Expanded(
-            flex: 3,
+            constraints: BoxConstraints(maxHeight: contentHeightPortrait),
             child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
                 metricPane,
                 estimateCard,
                 timeSlider,
                 const SizedBox(height: 4),
-                Expanded(child: chartPane),
+                Flexible(child: chartPane),
               ],
             ),
-          ),
-          const SizedBox(width: 12),
-        ],
-      ),
-    );
+          )
+        : SizedBox(
+            height: 400,
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: Column(
+                    children: [
+                      metricPane,
+                      estimateCard,
+                      timeSlider,
+                      const SizedBox(height: 4),
+                      Expanded(child: chartPane),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+              ],
+            ),
+          );
 
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -872,10 +972,11 @@ class _DeviceAccordion extends StatelessWidget {
                 padding: const EdgeInsets.all(10),
                 margin: const EdgeInsets.only(bottom: 10),
                 decoration: BoxDecoration(
-                  color: Colors.red.withOpacity(.08),
+                  color: Colors.red.withValues(alpha: .08),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: Text(state.error!, style: const TextStyle(color: Colors.redAccent)),
+                child: Text(state.error!,
+                    style: const TextStyle(color: Colors.redAccent)),
               ),
 
             // Controls
@@ -938,7 +1039,8 @@ class _BatteryBar extends StatefulWidget {
   State<_BatteryBar> createState() => _BatteryBarState();
 }
 
-class _BatteryBarState extends State<_BatteryBar> with SingleTickerProviderStateMixin {
+class _BatteryBarState extends State<_BatteryBar>
+    with SingleTickerProviderStateMixin {
   late AnimationController _ac;
   late Animation<double> _anim;
   double _fraction = 0.0;
@@ -947,7 +1049,8 @@ class _BatteryBarState extends State<_BatteryBar> with SingleTickerProviderState
   void initState() {
     super.initState();
     _fraction = (widget.percent.clamp(0.0, 100.0)) / 100.0;
-    _ac = AnimationController(vsync: this, duration: const Duration(milliseconds: 160));
+    _ac = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 160));
     _anim = AlwaysStoppedAnimation(_fraction);
   }
 
@@ -971,18 +1074,28 @@ class _BatteryBarState extends State<_BatteryBar> with SingleTickerProviderState
 
   Color _colorFor(double p) {
     p *= 100.0;
-    if (p < 25)   return _lerpColor(const Color(0xFFE53935), const Color(0xFFFF7043), p / 25);
-    if (p < 40)   return _lerpColor(const Color(0xFFFF7043), const Color(0xFFFFEE58), (p - 25) / 15);
-    if (p < 60)   return _lerpColor(const Color(0xFFFFEE58), const Color(0xFF26C6DA), (p - 40) / 20);
-    if (p < 75)   return _lerpColor(const Color(0xFF26C6DA), const Color(0xFF66BB6A), (p - 60) / 15);
+    if (p < 25)
+      return _lerpColor(
+          const Color(0xFFE53935), const Color(0xFFFF7043), p / 25);
+    if (p < 40)
+      return _lerpColor(
+          const Color(0xFFFF7043), const Color(0xFFFFEE58), (p - 25) / 15);
+    if (p < 60)
+      return _lerpColor(
+          const Color(0xFFFFEE58), const Color(0xFF26C6DA), (p - 40) / 20);
+    if (p < 75)
+      return _lerpColor(
+          const Color(0xFF26C6DA), const Color(0xFF66BB6A), (p - 60) / 15);
     return const Color(0xFF43A047);
   }
 
-  static Color _lerpColor(Color a, Color b, double t) => Color.lerp(a, b, t.clamp(0.0, 1.0))!;
-  Color _bestTextColor(Color bg) => bg.computeLuminance() > 0.55 ? Colors.black : Colors.white;
+  static Color _lerpColor(Color a, Color b, double t) =>
+      Color.lerp(a, b, t.clamp(0.0, 1.0))!;
+  Color _bestTextColor(Color bg) =>
+      bg.computeLuminance() > 0.55 ? Colors.black : Colors.white;
 
   @override
-  Widget build(BuildContext context) { // Bar Baterai di title
+  Widget build(BuildContext context) {
     final trackColor = Colors.grey;
     final textPct = (_fraction * 100.0).clamp(0.0, 100.0);
     final text = "${textPct.toStringAsFixed(0)}%";
@@ -1003,13 +1116,16 @@ class _BatteryBarState extends State<_BatteryBar> with SingleTickerProviderState
       clipBehavior: Clip.hardEdge,
       child: Stack(
         children: [
-          FractionallySizedBox(widthFactor: _fraction, child: Container(color: fillColor)),
+          FractionallySizedBox(
+              widthFactor: _fraction, child: Container(color: fillColor)),
           Center(
             child: Text(
               text,
               style: TextStyle(
-                fontWeight: fontWeight, fontSize: fontSize,
-                color: _fraction < 0.15 ? Colors.black : _bestTextColor(fillColor),
+                fontWeight: fontWeight,
+                fontSize: fontSize,
+                color:
+                    _fraction < 0.15 ? Colors.black : _bestTextColor(fillColor),
               ),
             ),
           ),
@@ -1017,13 +1133,33 @@ class _BatteryBarState extends State<_BatteryBar> with SingleTickerProviderState
       ),
     );
 
-    return ConstrainedBox(constraints: const BoxConstraints(minWidth: 120, maxWidth: 160), child: bar);
+    return ConstrainedBox(
+        constraints: const BoxConstraints(minWidth: 120, maxWidth: 160),
+        child: bar);
   }
 }
 
 class _MetricPane extends StatelessWidget {
-  const _MetricPane({required this.last});
+  const _MetricPane(
+      {required this.last, this.rawVoltx, this.rawAmpx, this.rawTempx});
   final ParsedReading? last;
+
+  // exact tokens coming from device (for display)
+  final String? rawVoltx;
+  final String? rawAmpx;
+  final String? rawTempx;
+
+  String _showRawOrDouble(String? raw, double? num, {int maxDecimals = 2}) {
+    // accept raw only if like 12 or 12.49 (not "12.")
+    final validRaw =
+        (raw != null && RegExp(r'^-?\d+(?:\.\d+)?$').hasMatch(raw));
+    if (validRaw) return raw!;
+    if (num == null) return "—";
+    String s = num.toStringAsFixed(maxDecimals);
+    s = s.replaceFirst(
+        RegExp(r'\.?0+$'), ''); // trim trailing zeros and trailing dot
+    return s;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1037,11 +1173,21 @@ class _MetricPane extends StatelessWidget {
       );
     }
     final r = last!;
+
     final tiles = [
-      _MetricTile(label: "Voltage", value: "${r.v.toStringAsFixed(2)} V"),
-      _MetricTile(label: "Current", value: "${r.a.toStringAsFixed(2)} A"),
-      _MetricTile(label: "Temperature", value: "${r.t.toStringAsFixed(1)} °C"),
-      _MetricTile(label: "Watt", value: "${(r.v * r.a).toStringAsFixed(2)} W"),
+      _MetricTile(
+          label: "Voltage",
+          value: "${_showRawOrDouble(rawVoltx, r.voltx, maxDecimals: 2)} V"),
+      _MetricTile(
+          label: "Current",
+          value: "${_showRawOrDouble(rawAmpx, r.ampx, maxDecimals: 2)} A"),
+      _MetricTile(
+          label: "Temperature",
+          value: "${_showRawOrDouble(rawTempx, r.tempx, maxDecimals: 2)} °C"),
+      _MetricTile(
+          label: "Watt",
+          value:
+              "${(r.voltx * r.ampx).toStringAsFixed(2).replaceFirst(RegExp(r'\.?0+$'), '')} W"),
     ];
 
     return LayoutBuilder(builder: (context, c) {
@@ -1080,17 +1226,28 @@ class _MetricTile extends StatelessWidget {
         color: cs.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: cs.outlineVariant),
-        boxShadow: [BoxShadow(blurRadius: 6, offset: const Offset(0, 1), color: cs.shadow.withOpacity(0.05))],
+        boxShadow: [
+          BoxShadow(
+              blurRadius: 6,
+              offset: const Offset(0, 1),
+              color: cs.shadow.withValues(alpha: 0.05))
+        ],
       ),
       child: Row(
         children: [
           Flexible(
-            child: Text("$label:", maxLines: 1, overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontWeight: FontWeight.w700, color: cs.onSurface)),
+            child: Text("$label:",
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontWeight: FontWeight.w700, color: cs.onSurface)),
           ),
           const SizedBox(width: 6),
           Expanded(
-            child: Text(value, textAlign: TextAlign.right, maxLines: 1, overflow: TextOverflow.ellipsis,
+            child: Text(value,
+                textAlign: TextAlign.right,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: cs.onSurfaceVariant)),
           ),
         ],
@@ -1099,26 +1256,26 @@ class _MetricTile extends StatelessWidget {
   }
 }
 
-/// ===== Estimation Card (tile baru) =====
+/// ===== Estimation Card =====
 class _EstimateCard extends StatelessWidget {
   const _EstimateCard({required this.state});
   final DeviceState state;
 
   String _fmtDur(Duration d) {
     final days = d.inDays;
-    final hrs  = d.inHours % 24;
-    final min  = d.inMinutes % 60;
-    final sec  = d.inSeconds % 60;
+    final hrs = d.inHours % 24;
+    final min = d.inMinutes % 60;
+    final sec = d.inSeconds % 60;
     final dayPart = days > 0 ? "${days}d " : "";
-    return "$dayPart${hrs.toString().padLeft(2,'0')}:${min.toString().padLeft(2,'0')}:${sec.toString().padLeft(2,'0')}";
+    return "$dayPart${hrs.toString().padLeft(2, '0')}:${min.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}";
   }
 
   String _fmtEta(DateTime now, Duration d) {
     final eta = now.add(d);
-    final hh = eta.hour.toString().padLeft(2,'0');
-    final mm = eta.minute.toString().padLeft(2,'0');
-    final dd = eta.day.toString().padLeft(2,'0');
-    final mon= eta.month.toString().padLeft(2,'0');
+    final hh = eta.hour.toString().padLeft(2, '0');
+    final mm = eta.minute.toString().padLeft(2, '0');
+    final dd = eta.day.toString().padLeft(2, '0');
+    final mon = eta.month.toString().padLeft(2, '0');
     return "$hh:$mm • $dd/$mon";
   }
 
@@ -1166,7 +1323,12 @@ class _EstimateCard extends StatelessWidget {
         color: cs.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: cs.outlineVariant),
-        boxShadow: [BoxShadow(blurRadius: 6, offset: const Offset(0, 1), color: cs.shadow.withOpacity(0.05))],
+        boxShadow: [
+          BoxShadow(
+              blurRadius: 6,
+              offset: const Offset(0, 1),
+              color: cs.shadow.withValues(alpha: 0.05))
+        ],
       ),
       child: Row(
         children: [
@@ -1174,7 +1336,7 @@ class _EstimateCard extends StatelessWidget {
             width: 38,
             height: 38,
             decoration: BoxDecoration(
-              color: accent.withOpacity(0.12),
+              color: accent.withValues(alpha: 0.12),
               borderRadius: BorderRadius.circular(10),
             ),
             child: Icon(icon, color: accent),
@@ -1225,7 +1387,7 @@ class _ChartPane extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 4, // +1 tab for Estimate
+      length: 4,
       child: Column(
         children: [
           const TabBar(
@@ -1243,17 +1405,17 @@ class _ChartPane extends StatelessWidget {
                 _ValueChart(
                   title: "Voltage (V)",
                   color: Colors.blue,
-                  selector: (r) => r.v,
+                  selector: (r) => r.voltx,
                   state: state,
                 ),
                 _ValueChart(
                   title: "Current (A)",
                   color: Colors.cyan,
-                  selector: (r) => r.a,
+                  selector: (r) => r.ampx,
                   state: state,
                 ),
                 _TempChart(state: state),
-                _EstimateChart(state: state), // NEW
+                _EstimateChart(state: state),
               ],
             ),
           ),
@@ -1326,15 +1488,19 @@ class _ValueChart extends StatelessWidget {
                 },
               ),
             ),
-            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            rightTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            topTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
           ),
           lineTouchData: const LineTouchData(enabled: true),
           borderData: FlBorderData(show: true),
           lineBarsData: [
             LineChartBarData(
               isCurved: true,
-              spots: data.isEmpty ? [FlSpot(end.millisecondsSinceEpoch.toDouble(), 0)] : data,
+              spots: data.isEmpty
+                  ? [FlSpot(end.millisecondsSinceEpoch.toDouble(), 0)]
+                  : data,
               barWidth: 1.4,
               dotData: const FlDotData(show: false),
               color: color,
@@ -1362,8 +1528,9 @@ class _TempChart extends StatelessWidget {
     final end = now.subtract(Duration(milliseconds: offsetMs));
     final start = end.subtract(_window);
 
-    final windowItems =
-    items.where((r) => !r.ts.isBefore(start) && !r.ts.isAfter(end)).toList();
+    final windowItems = items
+        .where((r) => !r.ts.isBefore(start) && !r.ts.isAfter(end))
+        .toList();
 
     final g = <FlSpot>[];
     final y = <FlSpot>[];
@@ -1371,16 +1538,16 @@ class _TempChart extends StatelessWidget {
 
     for (final m in windowItems) {
       final x = m.ts.millisecondsSinceEpoch.toDouble();
-      if (m.t < 30) {
-        g.add(FlSpot(x, m.t));
-      } else if (m.t <= 50) {
-        y.add(FlSpot(x, m.t));
+      if (m.tempx < 30) {
+        g.add(FlSpot(x, m.tempx));
+      } else if (m.tempx <= 50) {
+        y.add(FlSpot(x, m.tempx));
       } else {
-        r.add(FlSpot(x, m.t));
+        r.add(FlSpot(x, m.tempx));
       }
     }
 
-    final yVals = windowItems.map((e) => e.t).toList();
+    final yVals = windowItems.map((e) => e.tempx).toList();
     final yMin = yVals.isEmpty ? 0.0 : yVals.reduce(min);
     final yMax = yVals.isEmpty ? 1.0 : yVals.reduce(max);
     final pad = (yMax - yMin).abs() * 0.1 + 0.1;
@@ -1413,23 +1580,34 @@ class _TempChart extends StatelessWidget {
                 },
               ),
             ),
-            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            rightTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            topTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
           ),
           lineTouchData: const LineTouchData(enabled: true),
           borderData: FlBorderData(show: true),
           lineBarsData: [
             LineChartBarData(
-              isCurved: true, spots: g.isEmpty ? [] : g, barWidth: 1.4,
-              dotData: const FlDotData(show: false), color: Colors.green,
+              isCurved: true,
+              spots: g.isEmpty ? [] : g,
+              barWidth: 1.4,
+              dotData: const FlDotData(show: false),
+              color: Colors.green,
             ),
             LineChartBarData(
-              isCurved: true, spots: y.isEmpty ? [] : y, barWidth: 1.5,
-              dotData: const FlDotData(show: false), color: Colors.yellow.shade700,
+              isCurved: true,
+              spots: y.isEmpty ? [] : y,
+              barWidth: 1.5,
+              dotData: const FlDotData(show: false),
+              color: Colors.yellowAccent,
             ),
             LineChartBarData(
-              isCurved: true, spots: r.isEmpty ? [] : r, barWidth: 1.6,
-              dotData: const FlDotData(show: false), color: Colors.redAccent,
+              isCurved: true,
+              spots: r.isEmpty ? [] : r,
+              barWidth: 1.6,
+              dotData: const FlDotData(show: false),
+              color: Colors.redAccent,
             ),
           ],
         ),
@@ -1450,8 +1628,12 @@ class _EstimateChart extends StatelessWidget {
     final future = est?.futureSeries ?? [];
 
     final nowMs = DateTime.now().millisecondsSinceEpoch.toDouble();
-    final minPastX = past.isEmpty ? nowMs - const Duration(minutes: 2).inMilliseconds : past.first.x;
-    final maxFutureX = future.isEmpty ? nowMs + const Duration(minutes: 2).inMilliseconds : future.last.x;
+    final minPastX = past.isEmpty
+        ? nowMs - const Duration(minutes: 2).inMilliseconds
+        : past.first.x;
+    final maxFutureX = future.isEmpty
+        ? nowMs + const Duration(minutes: 2).inMilliseconds
+        : future.last.x;
 
     return Padding(
       padding: const EdgeInsets.only(top: 6.0),
@@ -1468,17 +1650,21 @@ class _EstimateChart extends StatelessWidget {
             ),
             bottomTitles: AxisTitles(
               sideTitles: SideTitles(
-                showTitles: true, reservedSize: 26,
+                showTitles: true,
+                reservedSize: 26,
                 getTitlesWidget: (val, meta) {
                   final dt = DateTime.fromMillisecondsSinceEpoch(val.toInt());
                   final hh = dt.hour.toString().padLeft(2, '0');
                   final mm = dt.minute.toString().padLeft(2, '0');
-                  return Text("$hh:$mm", style: Theme.of(context).textTheme.bodySmall);
+                  return Text("$hh:$mm",
+                      style: Theme.of(context).textTheme.bodySmall);
                 },
               ),
             ),
-            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            rightTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            topTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
           ),
           lineTouchData: const LineTouchData(enabled: true),
           borderData: FlBorderData(show: true),
