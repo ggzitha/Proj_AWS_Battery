@@ -1,93 +1,101 @@
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_AHTX0.h>
-#include <INA226.h>           // Rob Tillaart's library
+#include <INA226.h>
 #include <esp_sleep.h>
-#include "driver/rtc_io.h"    // for rtc_gpio_* pull configuration
+#include "driver/rtc_io.h"
+
+// ===== NimBLE (multi-central) =====
+#include <NimBLEDevice.h>
 
 // ===================== CONFIG =====================
 #define DEVICE_NUM              4          // 4 / 5 / 6
-#define WAKE_UP_BUTTON_PIN      33         // RTC IO PIN! (32–39, 0,2,4,12–15,25–27)
-#define USE_EXT0_WAKEUP         1          // 1 = EXT0 (single pin), 0 = EXT1 (mask)
-#define SLEEP_TIMEOUT_MS        60000      // 1 min idle (no BLE connection) -> sleep
-#define WAKE_INTERVAL_MS        120000     // timer wake every 2 minutes (optional)
-#define COUNTDOWN_SECONDS       10
+#define WAKE_UP_BUTTON_PIN      33         // RTC IO PIN
+#define USE_EXT0_WAKEUP         1          // 1 = EXT0, 0 = EXT1
+#define SLEEP_TIMEOUT_MS        60000      // 1 min idle -> sleep
+#define WAKE_INTERVAL_MS        300000     // timer wake every 5 minutes
+#define DOT_PERIOD_MS           500
+
+// BMS estimate for OLED bars (app does precise logic)
+#define SERIES_CELLS            3
+#define PCELL_VMIN              2.80f
+#define PCELL_VNOM              3.60f
+#define PCELL_VMAX              4.20f
 
 // ---- INA226 / SHUNT CONFIG ----
-// Your physical shunt is nominally 0.005 Ω, BUT DMM says 0.475A while chip showed 0.59A.
-// Refined shunt = 0.005 * (0.59 / 0.475) ≈ 0.00621 Ω
-#define SHUNT_NOMINAL_OHMS      0.00500f
-#define SHUNT_FOR_CAL           0.00621f   // <-- use this for configure() so current matches DMM
-#define MAX_CURRENT_A           20.0f      // target full-scale (not used by configure path)
+#define SHUNT_FOR_CAL           0.00621f   // refined shunt (Ohm)
+#define INA_LSB_mA_PRIMARY      0.625f
+#define INA_LSB_mA_FALLBACK     1.000f
+#define INA_I_OFFSET_mA         0.0f
+#define INA_V_SCALE_E4          10000
 
-// Manual calibration choices (safe defaults)
-#define INA_LSB_mA_PRIMARY      0.625f     // try 0.625 mA/bit first (supports up to ~20A)
-#define INA_LSB_mA_FALLBACK     1.000f     // fallback if library complains
-#define INA_I_OFFSET_mA         0.0f       // zero-current offset (refine later from no-load average)
-#define INA_V_SCALE_E4          10000      // bus voltage scale factor (10000 = 1.0000x)
-// =================================================
-
-// I2C pins (classic ESP32 defaults)
+// I2C pins
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
 
 // OLED
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // Sensors
 Adafruit_AHTX0 aht;
-INA226 ina226(0x40, &Wire);   // will be reassigned internally if another addr is detected
+INA226 ina226(0x40, &Wire);
 
-// BLE UUIDs (match Flutter)
-#define SERVICE_UUID        "91bad492-b950-4226-aa2b-4ede9fa42f59"
-#define CHARACTERISTIC_UUID "cba1d466-344c-4be3-ab3f-189daa0a16d8"
+// === BLE UUIDs (match Flutter) ===
+static NimBLEUUID SERVICE_UUID("91bad492-b950-4226-aa2b-4ede9fa42f59");
+static NimBLEUUID CHAR_UUID   ("cba1d466-344c-4be3-ab3f-189daa0a16d8");
 
 // BLE globals
-BLEServer* pServer = nullptr;
-BLECharacteristic* pDataCharacteristic = nullptr;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pDataChar = nullptr;
 String bleDeviceName;
-
-// State
 unsigned long lastConnectionTime = 0;
+unsigned long lastNotifyMillis = 0;
+unsigned long SendedDataRoutine = 2000; // Kirim Data tiap 2 detik
+
+// Adv / status animation
+uint8_t dotPhase = 0;
+unsigned long lastDotTick = 0;
 
 struct SensorReadings {
   float temperature;
   float current;   // A
   float voltage;   // V
-  float humidity;   // V
+  float humidity;  // %RH
   bool valid;
 };
 
-// --- BLE Callbacks ---
-class MyServerCallbacks: public BLEServerCallbacks {
-  void onConnect(BLEServer*) override {
-    deviceConnected = true;
-    Serial.println("Device connected");
-  }
-  void onDisconnect(BLEServer*) override {
-    deviceConnected = false;
-    Serial.println("Device disconnected");
-  }
-};
-
-// Prototypes
+// === Prototypes ===
 bool initializeHardware();
 void initializeBLE();
 SensorReadings getSensorReadings();
-void updateOLEDDisplay(SensorReadings readings, const String& status);
+void notifyAll(const SensorReadings& rd);
+void updateOLEDDisplay(const SensorReadings& rd);
+void drawBatteryBars(float percent);
+float estimateSOCpct(float packVolt);
+void drawCenteredBottom(const String& s);
 void print_wakeup_reason();
 void enterDeepSleep();
 void scanI2C();
+
+// ================== BLE CALLBACKS ==================
+// NimBLE 2.3.6 callback signatures
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
+    Serial.printf("Central connected (handle=%d), total=%d\n",
+                  info.getConnHandle(), s->getConnectedCount());
+    // keep advertising so more centrals can join
+    NimBLEDevice::startAdvertising();
+  }
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
+    Serial.printf("Central disconnected (handle=%d, reason=%d), total=%d\n",
+                  info.getConnHandle(), reason, s->getConnectedCount());
+    // restart advertising
+    NimBLEDevice::startAdvertising();
+  }
+};
 
 void setup() {
   Serial.begin(115200);
@@ -102,82 +110,65 @@ void setup() {
 
   initializeBLE();
 
-  pinMode(WAKE_UP_BUTTON_PIN, INPUT);  // external pulls recommended
+  pinMode(WAKE_UP_BUTTON_PIN, INPUT);
   lastConnectionTime = millis();
 
   Serial.println("Setup complete. Advertising...");
 }
 
 void loop() {
-  // Restart advertising after disconnect
-  if (!deviceConnected && oldDeviceConnected) {
-    delay(500);
-    BLEDevice::startAdvertising();
-    Serial.println("Restarted advertising");
-  }
-  if (deviceConnected && !oldDeviceConnected) {
-    oldDeviceConnected = deviceConnected;
-  }
+  const int connCount = pServer ? pServer->getConnectedCount() : 0;
 
-  if (deviceConnected) {
+  // Read sensors periodically for OLED + notifications
+  SensorReadings readings = getSensorReadings();
+
+  if (connCount > 0) {
     lastConnectionTime = millis();
 
-    SensorReadings readings = getSensorReadings();
-    if (readings.valid) {
-      updateOLEDDisplay(readings, "Connected");
-
-      char dataBuffer[64];
-      snprintf(dataBuffer, sizeof(dataBuffer),
-               "v=%.2f,a=%.2f,t=%.2f,h=%.2f",
-               readings.voltage, readings.current, readings.temperature, readings.humidity);
-      pDataCharacteristic->setValue(dataBuffer);
-      pDataCharacteristic->notify();
+    // Throttle BLE notify: kirim tiap SendedDataRoutine ms (default 2000 ms)
+    if (millis() - lastNotifyMillis >= SendedDataRoutine) {
+      lastNotifyMillis = millis();
+      if (readings.valid) notifyAll(readings);
     }
   } else {
-    // Not connected
+    // No connections: consider deep sleep after timeout
     if (millis() - lastConnectionTime > SLEEP_TIMEOUT_MS) {
-      // countdown on OLED before sleeping
-      for (int i = COUNTDOWN_SECONDS; i > 0; --i) {
+      for (int i = 5; i > 0; --i) {
         display.clearDisplay();
         display.setTextColor(SSD1306_WHITE);
         display.setTextSize(1);
         display.setCursor(0, 0);
-        display.println("Sleeping in...");
-        display.setTextSize(2);
-        display.setCursor(40, 28);
-        display.println(i);
+        display.print(bleDeviceName);
+        display.setCursor(0, 12);
+        display.print("Sleeping in ");
+        display.print(i);
+        display.print("s");
         display.display();
         delay(1000);
-        if (deviceConnected) break;
+        if (pServer->getConnectedCount() > 0) break;
       }
-      if (!deviceConnected) {
+      if (pServer->getConnectedCount() == 0) {
         enterDeepSleep();
-      }
-    } else {
-      SensorReadings readings = getSensorReadings();
-      if (readings.valid) {
-        updateOLEDDisplay(readings, "Advertising...");
       }
     }
   }
 
-  delay(2000);
+  // Update OLED with current state (smooth UI refresh)
+  updateOLEDDisplay(readings);
+
+  delay(200);  // modest loop rate
 }
 
 // ================== IMPLEMENTATION ==================
 
-void scanI2C()
-{
+void scanI2C() {
   Serial.println("I2C scan start...");
   byte count = 0;
-  for (uint8_t address = 1; address < 127; address++)
-  {
+  for (uint8_t address = 1; address < 127; address++) {
     Wire.beginTransmission(address);
     uint8_t error = Wire.endTransmission();
     if (error == 0) {
-      Serial.print("  - Found I2C 0x");
-      if (address < 16) Serial.print("0");
-      Serial.println(address, HEX);
+      Serial.printf("  - Found I2C 0x%02X\n", address);
       count++;
     }
   }
@@ -188,7 +179,7 @@ void scanI2C()
 bool initializeHardware() {
   // I2C
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(100000); // 100 kHz for stability on long wires / multiple devices
+  Wire.setClock(100000);
   delay(20);
 
   // OLED @ 0x3C
@@ -201,143 +192,110 @@ bool initializeHardware() {
   display.setTextSize(1);
   display.display();
 
-  // I2C scan to confirm all addresses
-  scanI2C();  // expect 0x38 (AHT), 0x3C (OLED), 0x40 (INA226)
+  scanI2C();  // expect 0x38 (AHT), 0x3C (OLED), 0x40..0x45 (INA226)
 
   // AHT10/AHT20 @ 0x38
   if (!aht.begin()) {
-    Serial.println("Failed to find AHT10/AHT20 at 0x38 (check wiring/power).");
+    Serial.println("Failed to find AHT10/AHT20 at 0x38.");
     return false;
   }
 
-  // Probe INA226 0x40..0x45 (A0/A1 strap)
+  // Probe INA226 0x40..0x45
   uint8_t inaAddr = 0;
   for (uint8_t addr = 0x40; addr <= 0x45; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) { inaAddr = addr; break; }
   }
   if (inaAddr == 0) {
-    Serial.println("INA226 not found on 0x40..0x45. Check A0/A1 jumpers, power, and SDA/SCL.");
+    Serial.println("INA226 not found on 0x40..0x45.");
     return false;
   }
 
-  // Recreate INA226 instance with detected address (keeps your symbol name)
-  static INA226 _inaTemp(0x40, &Wire);
+  // Rebind INA226 instance with detected address
   *(INA226*)&ina226 = INA226(inaAddr, &Wire);
 
   if (!ina226.begin()) {
-    Serial.println("INA226 begin() failed after address detection.");
+    Serial.println("INA226 begin() failed.");
     return false;
   }
-  delay(10);
 
-#ifdef INA226_LIB_VERSION
-  Serial.print("INA226_LIB_VERSION: ");
-  Serial.println(INA226_LIB_VERSION);
-#endif
-  Serial.print("MAN: 0x"); Serial.println(ina226.getManufacturerID(), HEX);
-  Serial.print("DIE: 0x"); Serial.println(ina226.getDieID(), HEX);
-
-  // ---------- MANUAL CALIBRATION (robust) ----------
-  // Use refined shunt so current matches DMM.
   int rc = ina226.configure(
-    SHUNT_FOR_CAL,        // refined shunt (Ohm)
-    INA_LSB_mA_PRIMARY,   // 0.625 mA/bit
-    INA_I_OFFSET_mA,      // zero-current offset (mA)
-    INA_V_SCALE_E4        // bus voltage scaling (x / 10000)
+    SHUNT_FOR_CAL,
+    INA_LSB_mA_PRIMARY,
+    INA_I_OFFSET_mA,
+    INA_V_SCALE_E4
   );
-
   if (rc != 0) {
-    Serial.print("INA226.configure(shunt=");
-    Serial.print(SHUNT_FOR_CAL, 6);
-    Serial.print(", LSB=");
-    Serial.print(INA_LSB_mA_PRIMARY, 3);
-    Serial.print(" mA) failed, rc=");
-    Serial.println(rc);
-
-    // Fallback to 1.0 mA/bit (coarser but very tolerant)
+    Serial.printf("INA226.configure(0.625 mA) rc=%d, fallback 1.000 mA\n", rc);
     rc = ina226.configure(
       SHUNT_FOR_CAL,
       INA_LSB_mA_FALLBACK,
       INA_I_OFFSET_mA,
       INA_V_SCALE_E4
     );
-
     if (rc != 0) {
-      Serial.print("INA226.configure(L=1.000 mA) failed, rc=");
-      Serial.println(rc);
-      Serial.println(">> Re-check wiring; try LSB 1.0–2.5 mA or adjust SHUNT_FOR_CAL slightly.");
+      Serial.printf("INA226.configure(1.000 mA) rc=%d\n", rc);
       return false;
-    } else {
-      Serial.println("Configured INA226 with LSB = 1.000 mA/bit (fallback).");
     }
-  } else {
-    Serial.println("Configured INA226 with LSB = 0.625 mA/bit (refined shunt).");
   }
 
-  // ---- Make INA226 actually measure continuously ----
-  // These APIs exist in recent Rob Tillaart INA226 versions
-  ina226.setAverage(64);                     // 1,4,16,64,128,... balance noise/speed
-  ina226.setBusVoltageConversionTime(1100);  // µs (140..8244). 1100 is good middle ground
+  ina226.setAverage(64);
+  ina226.setBusVoltageConversionTime(1100);
   ina226.setShuntVoltageConversionTime(1100);
-  ina226.setMode(7); // continuous shunt + bus (AKA INA226_MODE_SHUNT_BUS_CONT)
-  delay(5);
+  ina226.setMode(7); // continuous shunt+bus
 
-  // Print calibration summary
-  Serial.print("isCalibrated: ");
-  Serial.println(ina226.isCalibrated() ? "YES" : "NO");
-  Serial.print("CurrentLSB (A): ");
-  Serial.println(ina226.getCurrentLSB(), 6);
-  Serial.print("CurrentLSB (mA): ");
-  Serial.println(ina226.getCurrentLSB_mA(), 3);
-  Serial.print("Shunt (Ohm): ");
-  Serial.println(ina226.getShunt(), 6);
-  Serial.print("MaxCurrent (A): ");
-  Serial.println(ina226.getMaxCurrent(), 3);
-
-  // Quick sanity prints (optional)
-  for (int i = 0; i < 5; i++) {
-    float bv = ina226.getBusVoltage();
-    float sv = ina226.getShuntVoltage_mV();
-    float im = ina226.getCurrent_mA();
-    Serial.print("Bus="); Serial.print(bv, 3); Serial.print(" V  ");
-    Serial.print("Shunt="); Serial.print(sv, 3); Serial.print(" mV  ");
-    Serial.print("I="); Serial.print(im, 1); Serial.println(" mA");
-    delay(300);
-  }
-
-  Serial.print("INA226 OK at 0x");
-  Serial.println(inaAddr, HEX);
-  Serial.println("Hardware initialized OK.");
+  Serial.printf("INA226 @0x%02X ready\n", inaAddr);
   return true;
 }
 
 void initializeBLE() {
   bleDeviceName = String("BATT-Mon_") + String(DEVICE_NUM);
-  BLEDevice::init(bleDeviceName.c_str());
 
-  BLEServer* server = BLEDevice::createServer();
-  server->setCallbacks(new MyServerCallbacks());
-  pServer = server;
+  NimBLEDevice::init(bleDeviceName.c_str());
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // optional
+  NimBLEDevice::setMTU(185);                // optional
 
-  BLEService* svc = pServer->createService(SERVICE_UUID);
-  pDataCharacteristic = svc->createCharacteristic(
-    CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* svc = pServer->createService(SERVICE_UUID);
+
+  pDataChar = svc->createCharacteristic(
+      CHAR_UUID,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
   );
-  pDataCharacteristic->addDescriptor(new BLE2902());
+
+  // Portable CCCD (0x2902)
+  NimBLEDescriptor* cccd = new NimBLEDescriptor(
+      (uint16_t)0x2902,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
+      2 // 2-byte CCCD
+  );
+  // Default notifications ON (0x0001, little-endian)
+  uint8_t cccdVal[2] = {0x01, 0x00};
+  cccd->setValue(cccdVal, sizeof(cccdVal));
+  pDataChar->addDescriptor(cccd);
+
   svc->start();
 
-  BLEAdvertising* adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(SERVICE_UUID);
-  adv->setScanResponse(true);
-  adv->setMinPreferred(0x06);
-  adv->setMinPreferred(0x12);
+  // --- Advertising & Scan Response (NimBLE 2.x style) ---
+  NimBLEAdvertisementData advData;
+  advData.setName(bleDeviceName.c_str());
+  advData.setCompleteServices(SERVICE_UUID);
 
-  BLEDevice::startAdvertising();
+  NimBLEAdvertisementData scanResp;
+  scanResp.setName(bleDeviceName.c_str());
 
-  Serial.print("Advertising as: ");
-  Serial.println(bleDeviceName);
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->setAdvertisementData(advData);
+  adv->setScanResponseData(scanResp);
+
+  // Optional: tweak intervals
+  // adv->setMinInterval(0x20); // ~20 ms
+  // adv->setMaxInterval(0x40); // ~40 ms
+
+  adv->start();  // continue advertising even when connected
+  Serial.printf("Advertising as %s\n", bleDeviceName.c_str());
 }
 
 SensorReadings getSensorReadings() {
@@ -348,53 +306,134 @@ SensorReadings getSensorReadings() {
   if (aht.getEvent(&humidity, &temp)) {
     r.temperature = temp.temperature;
     r.humidity    = humidity.relative_humidity;
-    r.voltage     = ina226.getBusVoltage();          // Volts
-    r.current     = ina226.getCurrent_mA() / 1000.0; // Amps (library returns mA)
+    r.voltage     = ina226.getBusVoltage();          // V
+    r.current     = ina226.getCurrent_mA() / 1000.0; // A
     r.valid       = true;
-  } else {
-    Serial.println("Failed to read AHT sensor");
   }
   return r;
 }
 
-void updateOLEDDisplay(SensorReadings readings, const String& status) {
+void notifyAll(const SensorReadings& rd) {
+  if (!pDataChar || !rd.valid) return;
+
+  // EXACT format for the phone parser: v%.2fa%.2ft%.2fh%.1f
+  char buf[128];
+  snprintf(buf, sizeof(buf),
+           "v%.2fa%.2ft%.2fh%.1f",
+           rd.voltage, rd.current, rd.temperature, rd.humidity);
+
+  pDataChar->setValue((uint8_t*)buf, strlen(buf));
+  pDataChar->notify(); // to all subscribed centrals
+}
+
+float estimateSOCpct(float packVolt) {
+  // Simple piecewise Min -> Nom -> Max (OLED only)
+  float vcell = packVolt / SERIES_CELLS;
+  if (vcell <= PCELL_VMIN) return 0.0f;
+  if (vcell >= PCELL_VMAX) return 100.0f;
+  if (vcell <= PCELL_VNOM) {
+    return 50.0f * (vcell - PCELL_VMIN) / (PCELL_VNOM - PCELL_VMIN);
+  }
+  return 50.0f + 50.0f * (vcell - PCELL_VNOM) / (PCELL_VMAX - PCELL_VNOM);
+}
+
+void drawBatteryBars(float percent) {
+  // 4 segments at 25/50/75/100 like your mock
+  const int y = 9, h = 8;
+  struct Seg { int x,w; float th; };
+  Seg segs[4] = {
+    {  0,26, 25.0f },
+    { 29,34, 50.0f },
+    { 67,32, 75.0f },
+    {102,26,100.0f }
+  };
+
+  for (int i=0;i<3;i++) {
+    if (percent >= segs[i].th) display.fillRect(segs[i].x, y, segs[i].w, h, SSD1306_WHITE);
+    else display.drawRect(segs[i].x, y, segs[i].w, h, SSD1306_WHITE);
+  }
+  // Last segment: outline + fill at >=100%
+  display.drawRect(segs[3].x, y, segs[3].w, h, SSD1306_WHITE);
+  if (percent >= 100.0f) {
+    display.fillRect(segs[3].x, y, segs[3].w, h, SSD1306_WHITE);
+  }
+}
+
+void drawCenteredBottom(const String& s) {
+  // Approx width ~6 px per char with default font
+  int w = s.length() * 6;
+  int x = (SCREEN_WIDTH - w) / 2;
+  int y = 55;
+  if (x < 0) x = 0;
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(x, y);
+  display.print(s);
+}
+
+void updateOLEDDisplay(const SensorReadings& rd) {
   display.clearDisplay();
+  display.setTextWrap(false);                 // prevent wrapping into bottom line
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println(bleDeviceName);
-  display.print("Status: ");
-  display.println(status);
 
-  display.setCursor(0, 20);
-  display.printf("V: %.2f V\n", readings.voltage);
-  display.printf("A: %.2f A\n", readings.current);
-  display.printf("T: %.2f C\n", readings.temperature);
-  display.printf("H: %.2f RH\n", readings.humidity);
+  // Header name
+  display.setCursor(0, 0);
+  display.print(bleDeviceName);
+
+  // Battery bars (top)
+  float pct = rd.valid ? estimateSOCpct(rd.voltage) : 0.0f;
+  drawBatteryBars(pct);                        // uses y=9, h=8
+
+  // Separators
+  display.drawFastHLine(0, 18, 128, SSD1306_WHITE);  // top of metric area
+  display.drawFastVLine(64, 18, 33, SSD1306_WHITE);  // vertical divider
+  display.drawFastHLine(0, 53, 128, SSD1306_WHITE);  // bottom line
+
+  // Left: V / A
+  display.setCursor(0, 25);
+  if (rd.valid) display.printf("V= %.2f V", rd.voltage); else display.print("V= --.--");
+  display.setCursor(0, 37);
+  if (rd.valid) display.printf("A= %.2f A", rd.current); else display.print("A= --.--");
+
+  // Right: T / H
+  display.setCursor(67, 25);
+  if (rd.valid) display.printf("T= %.2f C", rd.temperature); else display.print("T= --.--");
+  display.setCursor(68, 37);
+  if (rd.valid) display.printf("H= %.1f%%RH", rd.humidity); else display.print("H= --.--");
+
+  // Bottom centered status
+  const int connCount = pServer ? pServer->getConnectedCount() : 0;
+  String status;
+  if (connCount > 0) {
+    status = String("Connected (") + String(connCount) + String(")");
+  } else {
+    unsigned long now = millis();
+    if (now - lastDotTick >= DOT_PERIOD_MS) {
+      lastDotTick = now;
+      dotPhase = (dotPhase + 1) % 4;
+    }
+    status = "Adv";
+    for (uint8_t i = 0; i < dotPhase; ++i) status += " .";
+  }
+  // Center on y=56 (clear of the 53px line)
+  int w = status.length() * 6;
+  int x = (SCREEN_WIDTH - w) / 2; if (x < 0) x = 0;
+  display.setCursor(x, 56);
+  display.print(status);
+
   display.display();
 }
 
 void print_wakeup_reason() {
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_EXT0:
-      Serial.println("Wakeup caused by external signal using RTC_IO (EXT0)");
-      break;
-    case ESP_SLEEP_WAKEUP_EXT1:
-      Serial.println("Wakeup caused by external signal using RTC_CNTL (EXT1)");
-      break;
-    case ESP_SLEEP_WAKEUP_TIMER:
-      Serial.println("Wakeup caused by timer");
-      break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD:
-      Serial.println("Wakeup caused by touchpad");
-      break;
-    case ESP_SLEEP_WAKEUP_ULP:
-      Serial.println("Wakeup caused by ULP program");
-      break;
-    default:
-      Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason);
-      break;
+    case ESP_SLEEP_WAKEUP_EXT0: Serial.println("Wakeup: EXT0"); break;
+    case ESP_SLEEP_WAKEUP_EXT1: Serial.println("Wakeup: EXT1"); break;
+    case ESP_SLEEP_WAKEUP_TIMER: Serial.println("Wakeup: TIMER"); break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup: TOUCH"); break;
+    case ESP_SLEEP_WAKEUP_ULP: Serial.println("Wakeup: ULP"); break;
+    default: Serial.printf("Wakeup not from deep sleep: %d\n", wakeup_reason); break;
   }
 }
 
@@ -406,18 +445,15 @@ void enterDeepSleep() {
   display.display();
   display.ssd1306_command(SSD1306_DISPLAYOFF);
 
-  // Timer wake (comment out if you only want button wake)
+  // Timer wake
   esp_sleep_enable_timer_wakeup((uint64_t)WAKE_INTERVAL_MS * 1000ULL);
 
 #if USE_EXT0_WAKEUP
-  // EXT0 (single pin, level wake)
   gpio_num_t WAKEUP_GPIO = (gpio_num_t)WAKE_UP_BUTTON_PIN;
-  // Wake on HIGH level; keep pin LOW during sleep with pulldown.
-  esp_sleep_enable_ext0_wakeup(WAKEUP_GPIO, 1); // 1 = HIGH, 0 = LOW
+  esp_sleep_enable_ext0_wakeup(WAKEUP_GPIO, 1); // HIGH
   rtc_gpio_pullup_dis(WAKEUP_GPIO);
   rtc_gpio_pulldown_en(WAKEUP_GPIO);
 #else
-  // EXT1 (mask, any-high)
   uint64_t mask = (1ULL << WAKE_UP_BUTTON_PIN);
   esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_HIGH);
   rtc_gpio_pulldown_en((gpio_num_t)WAKE_UP_BUTTON_PIN);
@@ -425,5 +461,4 @@ void enterDeepSleep() {
 #endif
 
   esp_deep_sleep_start();
-  // never returns
 }
