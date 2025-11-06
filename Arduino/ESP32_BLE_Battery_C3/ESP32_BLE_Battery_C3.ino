@@ -9,10 +9,14 @@
 // ===== NimBLE (multi-central) =====
 #include <NimBLEDevice.h>
 
+// ===== WiFi / OTA (ESP32) =====
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+
 // ===================== CONFIG =====================
-#define DEVICE_NUM              5          // 4 / 5 / 6
+#define DEVICE_NUM              6          // 4 / 5 / 6 -> used in names
 #define WAKE_UP_BUTTON_PIN      2          // Button to GND; we use pull-up and wake on LOW
-#define USE_EXT0_WAKEUP         0          // C3: keep 0 (EXT1) unless you know your pin is valid for EXT0
+#define USE_EXT0_WAKEUP         0          // Keep 0 (EXT1/GPIO wake) on C3
 
 #define SLEEP_TIMEOUT_MS        60000      // 1 min idle -> sleep
 #define WAKE_INTERVAL_MS        300000     // timer wake every 5 minutes
@@ -34,6 +38,11 @@
 // I2C pins (ESP32-C3)
 #define I2C_SDA_PIN 3
 #define I2C_SCL_PIN 4
+
+// OTA AP credentials
+#define OTA_PASSWORD            "123456789"
+#define OTA_PORT                3232
+#define OTA_HOLD_MS             5000       // hold time to toggle OTA
 
 // OLED
 #define SCREEN_WIDTH 128
@@ -60,6 +69,18 @@ unsigned long SendedDataRoutine = 2000; // Kirim Data tiap 2 detik
 uint8_t dotPhase = 0;
 unsigned long lastDotTick = 0;
 
+// OTA state
+bool otaMode = false;
+String otaSSID;
+IPAddress otaIP(0,0,0,0);
+
+// Button/hold detection (shared for enter/exit OTA)
+bool holdInProgress = false;
+unsigned long holdStartMs = 0;
+int overlayCountdown = -1;          // -1 = no overlay
+String headerOverlay = "";          // "Update(4)" ... "Update(1)"
+
+// ======== Define SensorReadings BEFORE prototypes (fix) ========
 struct SensorReadings {
   float temperature;
   float current;   // A
@@ -68,7 +89,7 @@ struct SensorReadings {
   bool valid;
 };
 
-// === Prototypes ===
+// ======== Prototypes ========
 bool initializeHardware();
 void initializeBLE();
 SensorReadings getSensorReadings();
@@ -81,19 +102,21 @@ void print_wakeup_reason();
 void enterDeepSleep();
 void scanI2C();
 
+void checkOTAToggle();        // NEW: handle 5s hold & overlay text
+void startOTA_AP_Mode();      // NEW
+void stopOTA_AP_Mode();       // NEW
+String twoDigit(int n);       // NEW
+
 // ================== BLE CALLBACKS ==================
-// NimBLE 2.3.6 callback signatures
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
     Serial.printf("Central connected (handle=%d), total=%d\n",
                   info.getConnHandle(), s->getConnectedCount());
-    // keep advertising so more centrals can join
     NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     Serial.printf("Central disconnected (handle=%d, reason=%d), total=%d\n",
                   info.getConnHandle(), reason, s->getConnectedCount());
-    // restart advertising
     NimBLEDevice::startAdvertising();
   }
 };
@@ -111,15 +134,61 @@ void setup() {
 
   initializeBLE();
 
-  // IMPORTANT for wake-on-LOW: keep pin HIGH when idle
+  // Wake pin idle HIGH for wake-on-LOW
   pinMode(WAKE_UP_BUTTON_PIN, INPUT_PULLUP);
 
   lastConnectionTime = millis();
+
+  // Optionally allow entering OTA right after boot if held
+  checkOTAToggle();
 
   Serial.println("Setup complete. Advertising...");
 }
 
 void loop() {
+  // Always watch for 5s hold to enter/exit OTA and drive overlay text
+  checkOTAToggle();
+
+  if (otaMode) {
+    ArduinoOTA.handle();
+
+    // OTA page on OLED
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("OTA MODE");
+
+    // Show overlay countdown if user is holding to EXIT
+    if (overlayCountdown > 0) {
+      // right-aligned overlay on header line
+      String ov = "Exit-(" + String(overlayCountdown) + ")";
+      int ox = SCREEN_WIDTH - (ov.length() * 6);
+      if (ox < 0) ox = 0;
+      display.setCursor(ox, 0);
+      display.print(ov);
+    }
+
+    display.setCursor(0, 12);
+    display.print("SSID: ");
+    display.print(otaSSID);
+    display.setCursor(0, 24);
+    display.print("PWD : ");
+    display.print(OTA_PASSWORD);
+    display.setCursor(0, 36);
+    display.print("IP  : ");
+    if (otaIP == IPAddress(0,0,0,0)) display.print("192.168.4.1");
+    else display.print(otaIP);
+    display.setCursor(0, 48);
+    display.print("Update via Arduino-IDE");
+    display.setCursor(0, 56);
+    display.print("Net-PORT or espota.py");
+    display.display();
+
+    delay(20);
+    return;  // no deep sleep in OTA
+  }
+
   const int connCount = pServer ? pServer->getConnectedCount() : 0;
 
   // Read sensors periodically for OLED + notifications
@@ -128,14 +197,14 @@ void loop() {
   if (connCount > 0) {
     lastConnectionTime = millis();
 
-    // Throttle BLE notify: kirim tiap SendedDataRoutine ms (default 2000 ms)
+    // Throttle BLE notify
     if (millis() - lastNotifyMillis >= SendedDataRoutine) {
       lastNotifyMillis = millis();
       if (readings.valid) notifyAll(readings);
     }
   } else {
-    // No connections: consider deep sleep after timeout
-    if (millis() - lastConnectionTime > SLEEP_TIMEOUT_MS) {
+    // No connections: consider deep sleep after timeout (unless user is holding)
+    if (!holdInProgress && (millis() - lastConnectionTime > SLEEP_TIMEOUT_MS)) {
       for (int i = 5; i > 0; --i) {
         display.clearDisplay();
         display.setTextColor(SSD1306_WHITE);
@@ -247,13 +316,14 @@ bool initializeHardware() {
   ina226.setShuntVoltageConversionTime(1100);
   ina226.setMode(7); // continuous shunt+bus
 
+  // BLE name (also used in header)
+  bleDeviceName = String("BATT-Mon_") + String(DEVICE_NUM);
+
   Serial.printf("INA226 @0x%02X ready\n", inaAddr);
   return true;
 }
 
 void initializeBLE() {
-  bleDeviceName = String("BATT-Mon_") + String(DEVICE_NUM);
-
   NimBLEDevice::init(bleDeviceName.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // optional
   NimBLEDevice::setMTU(185);                // optional
@@ -292,10 +362,6 @@ void initializeBLE() {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->setAdvertisementData(advData);
   adv->setScanResponseData(scanResp);
-
-  // Optional: tweak intervals
-  // adv->setMinInterval(0x20); // ~20 ms
-  // adv->setMaxInterval(0x40); // ~40 ms
 
   adv->start();  // continue advertising even when connected
   Serial.printf("Advertising as %s\n", bleDeviceName.c_str());
@@ -341,26 +407,39 @@ float estimateSOCpct(float packVolt) {
 }
 
 void drawBatteryBars(float percent) {
-  // 4 segments at 25/50/75/100 like your mock
-  const int y = 9, h = 8;
-  struct Seg { int x,w; float th; };
-  Seg segs[4] = {
-    {  0,26, 25.0f },
-    { 29,34, 50.0f },
-    { 67,32, 75.0f },
-    {102,26,100.0f }
-  };
+  // Clamp
+  if (percent < 0.0f)  percent = 0.0f;
+  if (percent > 100.0f) percent = 100.0f;
 
-  for (int i=0;i<3;i++) {
-    if (percent >= segs[i].th) display.fillRect(segs[i].x, y, segs[i].w, h, SSD1306_WHITE);
-    else display.drawRect(segs[i].x, y, segs[i].w, h, SSD1306_WHITE);
+  // Bar geometry (leaves space on the right for "100%")
+  const int barX = 0;
+  const int barY = 9;
+  const int barW = 100;  // 100px bar + 4px gap + up to 24px text = 128px total
+  const int barH = 8;
+
+  // Outline
+  display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
+
+  // Fill (inner, so it doesn't overwrite the outline)
+  int fillW = (int)((barW - 2) * (percent / 100.0f) + 0.5f);
+  if (fillW > 0) {
+    display.fillRect(barX + 1, barY + 1, fillW, barH - 2, SSD1306_WHITE);
   }
-  // Last segment: outline + fill at >=100%
-  display.drawRect(segs[3].x, y, segs[3].w, h, SSD1306_WHITE);
-  if (percent >= 100.0f) {
-    display.fillRect(segs[3].x, y, segs[3].w, h, SSD1306_WHITE);
-  }
+
+  // Percentage text at the end of the bar
+  int ipct = (int)(percent + 0.5f);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", ipct);
+
+  int textX = barX + barW + 4;  // 4px gap after the bar
+  int textY = barY;             // top-aligned with the bar; looks good with size=1
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(textX, textY);
+  display.print(buf);
 }
+
 
 void drawCenteredBottom(const String& s) {
   // Approx width ~6 px per char with default font
@@ -376,22 +455,35 @@ void drawCenteredBottom(const String& s) {
 
 void updateOLEDDisplay(const SensorReadings& rd) {
   display.clearDisplay();
-  display.setTextWrap(false);                 // prevent wrapping into bottom line
+  display.setTextWrap(false);
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  // Header name
+  // Header name (left)
   display.setCursor(0, 0);
   display.print(bleDeviceName);
 
+  // Header overlay (right): "Update(4..1)" while holding
+  if (overlayCountdown > 0) {
+    headerOverlay = "ROM-(" + String(overlayCountdown) + ")";
+  } else {
+    headerOverlay = "";
+  }
+  if (headerOverlay.length() > 0) {
+    int ox = SCREEN_WIDTH - (headerOverlay.length() * 6);
+    if (ox < 0) ox = 0;
+    display.setCursor(ox, 0);
+    display.print(headerOverlay);
+  }
+
   // Battery bars (top)
   float pct = rd.valid ? estimateSOCpct(rd.voltage) : 0.0f;
-  drawBatteryBars(pct);                        // uses y=9, h=8
+  drawBatteryBars(pct);
 
   // Separators
-  display.drawFastHLine(0, 18, 128, SSD1306_WHITE);  // top of metric area
-  display.drawFastVLine(64, 18, 33, SSD1306_WHITE);  // vertical divider
-  display.drawFastHLine(0, 53, 128, SSD1306_WHITE);  // bottom line
+  display.drawFastHLine(0, 18, 128, SSD1306_WHITE);
+  display.drawFastVLine(64, 18, 33, SSD1306_WHITE);
+  display.drawFastHLine(0, 53, 128, SSD1306_WHITE);
 
   // Left: V / A
   display.setCursor(0, 25);
@@ -409,17 +501,19 @@ void updateOLEDDisplay(const SensorReadings& rd) {
   const int connCount = pServer ? pServer->getConnectedCount() : 0;
   String status;
   if (connCount > 0) {
-    status = String("Connected (") + String(connCount) + String(")");
+    String leftDots, rightDots;
+    for (uint8_t i = 0; i < dotPhase; ++i) { leftDots += ". "; rightDots += " ."; }
+    status = leftDots + String("Connected (") + String(connCount) + String(")") + rightDots;
   } else {
     unsigned long now = millis();
     if (now - lastDotTick >= DOT_PERIOD_MS) {
       lastDotTick = now;
       dotPhase = (dotPhase + 1) % 4;
     }
-    status = "Adv";
-    for (uint8_t i = 0; i < dotPhase; ++i) status += " .";
+    String leftDots, rightDots;
+    for (uint8_t i = 0; i < dotPhase; ++i) { leftDots += ". "; rightDots += " ."; }
+    status = leftDots + "Adv" + rightDots;
   }
-  // Center on y=56 (clear of the 53px line)
   int w = status.length() * 6;
   int x = (SCREEN_WIDTH - w) / 2; if (x < 0) x = 0;
   display.setCursor(x, 56);
@@ -437,6 +531,7 @@ void print_wakeup_reason() {
     case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup: TOUCH"); break;
     case ESP_SLEEP_WAKEUP_ULP: Serial.println("Wakeup: ULP"); break;
     case ESP_SLEEP_WAKEUP_GPIO: {
+      // FIX: use esp_sleep_get_gpio_wakeup_status() on IDF v5
       uint64_t m = esp_sleep_get_gpio_wakeup_status();
       Serial.printf("Wakeup: GPIO (mask=0x%llX)\n", (unsigned long long)m);
       break;
@@ -457,8 +552,7 @@ void enterDeepSleep() {
   esp_sleep_enable_timer_wakeup((uint64_t)WAKE_INTERVAL_MS * 1000ULL);
 
 #if USE_EXT0_WAKEUP
-  gpio_num_t WAKEUP_GPIO = (gpio_num_t)WAKE_UP_BUTTON_PIN;
-  // If needed for EXT0 on your setup:
+  // EXT0 (if you really need it)
   esp_deep_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_UP_BUTTON_PIN, 1);
   gpio_pullup_dis((gpio_num_t)WAKE_UP_BUTTON_PIN);
   gpio_pulldown_en((gpio_num_t)WAKE_UP_BUTTON_PIN);
@@ -472,4 +566,89 @@ void enterDeepSleep() {
 #endif
 
   esp_deep_sleep_start();
+}
+
+// ================== OTA HELPERS ==================
+
+String twoDigit(int n) {
+  if (n < 10) return "0" + String(n);
+  return String(n);
+}
+
+void startOTA_AP_Mode() {
+  if (otaMode) return;
+  otaMode = true;
+
+  otaSSID = "ROM_BATT-Mon_" + String(DEVICE_NUM);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(otaSSID.c_str(), OTA_PASSWORD);
+  otaIP = WiFi.softAPIP();
+
+  ArduinoOTA.setPort(OTA_PORT);
+  ArduinoOTA.setHostname(otaSSID.c_str());
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() { Serial.println("OTA Start"); });
+  ArduinoOTA.onEnd([]()   { Serial.println("\nOTA End"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static uint8_t last = 255;
+    uint8_t pct = (progress * 100) / total;
+    if (pct != last) { last = pct; Serial.printf("OTA %u%%\n", pct); }
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]\n", error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("OTA AP started: SSID=%s PWD=%s IP=%s\n",
+                otaSSID.c_str(), OTA_PASSWORD, otaIP.toString().c_str());
+}
+
+void stopOTA_AP_Mode() {
+  if (!otaMode) return;
+  ArduinoOTA.end();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  otaMode = false;
+  otaIP = IPAddress(0,0,0,0);
+  Serial.println("OTA AP stopped");
+}
+
+void checkOTAToggle() {
+  // Button is active-LOW (to GND). Show overlay "Update(4..1)" for last 4s of hold.
+  int pin = digitalRead(WAKE_UP_BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (pin == LOW) {
+    if (!holdInProgress) {
+      holdInProgress = true;
+      holdStartMs = now;
+      overlayCountdown = 4;   // start at 4
+    } else {
+      unsigned long held = now - holdStartMs;
+      long remain = (long)OTA_HOLD_MS - (long)held;
+      int show = (remain > 0) ? ((remain + 999) / 1000) : 0; // ceil
+      if (show > 4) show = 4;   // clamp to 4..1
+      if (show < 0) show = 0;
+      overlayCountdown = show;
+
+      if (held >= OTA_HOLD_MS) {
+        // Toggle OTA mode
+        if (otaMode) stopOTA_AP_Mode();
+        else startOTA_AP_Mode();
+
+        // prevent rapid retrigger; wait for release
+        while (digitalRead(WAKE_UP_BUTTON_PIN) == LOW) {
+          delay(10);
+        }
+        holdInProgress = false;
+        overlayCountdown = -1;
+      }
+    }
+  } else {
+    // Released
+    holdInProgress = false;
+    overlayCountdown = -1;
+  }
 }
