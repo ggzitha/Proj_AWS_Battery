@@ -14,7 +14,7 @@
 #include <ArduinoOTA.h>
 
 // ===================== CONFIG =====================
-#define DEVICE_NUM              6          // 4 / 5 / 6 -> used in names
+#define DEVICE_NUM              4          // 4 / 5 / 6 -> used in names
 #define WAKE_UP_BUTTON_PIN      2          // Button to GND; we use pull-up and wake on LOW
 #define USE_EXT0_WAKEUP         0          // Keep 0 (EXT1/GPIO wake) on C3
 
@@ -23,9 +23,9 @@
 #define DOT_PERIOD_MS           500
 
 // BMS estimate for OLED bars (app does precise logic)
-#define SERIES_CELLS            3
+#define SERIES_CELLS            4
 #define PCELL_VMIN              2.80f
-#define PCELL_VNOM              3.60f
+#define PCELL_VNOM              3.65f
 #define PCELL_VMAX              4.20f
 
 // ---- INA226 / SHUNT CONFIG ----
