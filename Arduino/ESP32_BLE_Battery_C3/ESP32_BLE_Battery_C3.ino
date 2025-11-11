@@ -14,7 +14,7 @@
 #include <ArduinoOTA.h>
 
 // ===================== CONFIG =====================
-#define DEVICE_NUM              6          // 4 / 5 / 6 -> used in names
+#define DEVICE_NUM              5          // 4 / 5 / 6 -> used in names
 #define WAKE_UP_BUTTON_PIN      2          // Button to GND; we use pull-up and wake on LOW
 #define USE_EXT0_WAKEUP         0          // Keep 0 (EXT1/GPIO wake) on C3
 
@@ -24,20 +24,37 @@
 
 // BMS estimate for OLED bars (app does precise logic)
 #define SERIES_CELLS            4
-#define PCELL_VMIN              2.75f
-#define PCELL_VNOM              3.60f
+#define PARALLEL_CELLS          3
+#define PCELL_VMIN              2.70f
+#define PCELL_VNOM              3.65f
 #define PCELL_VMAX              4.20f
 
 // ---- INA226 / SHUNT CONFIG ----
 #define SHUNT_FOR_CAL           0.00621f   // refined shunt (Ohm)
 #define INA_LSB_mA_PRIMARY      0.625f
 #define INA_LSB_mA_FALLBACK     1.000f
-#define INA_I_OFFSET_mA_CFG     0.0f       // keep 0; we apply our own offset below
+#define INA_I_OFFSET_mA_CFG     0.0f       // keep 0 in driver; we apply manual offsets below
 #define INA_V_SCALE_E4          10000
 
 // ===== User calibration offsets (apply AFTER sensor read) =====
-#define V_OFFSET_mV             0.0f       // add/subtract voltage in millivolts (e.g. +25.0f)
-#define I_OFFSET_mA             0.0f       // add/subtract current in milliamps (e.g. -5.0f)
+#define V_OFFSET_mV             0.0f       // e.g. +25.0f to add +25 mV to pack voltage
+#define I_OFFSET_mA             0.0f       // e.g. -6.0f to subtract 6 mA
+
+// ===== Load compensation + smoothing (SoC under load) =====
+// LiitoKala spec says internal resistance <17 mΩ per cell. For 4S3P:
+// - 3P lowers per-group IR to ~17/3 ≈ 5.7 mΩ
+// - 4S makes pack IR ≈ 4 * 5.7 ≈ 22.8 mΩ
+// Add extra for BMS FETs + shunt (6.21 mΩ) + wiring. Start around 40–80 mΩ.
+#define R_CELL_mOHM             17.0f      // per cell (spec upper bound)
+#define R_EXTRA_mOHM            60.0f      // BMS FETs + shunt + wiring (tune up/down) lihat hit di chat GPT hasi 190.0 tapi aneh
+#define SOC_EMA_ALPHA           0.20f      // 0..1; higher = snappier, lower = steadier
+
+static float R_PACK_OHM() {
+  float r_group_mOhm = R_CELL_mOHM / PARALLEL_CELLS;   // mΩ per series group (cells in parallel)
+  float r_series_mOhm = r_group_mOhm * SERIES_CELLS;   // mΩ for series stack
+  float r_total_mOhm  = r_series_mOhm + R_EXTRA_mOHM;  // add external resistances
+  return r_total_mOhm / 1000.0f;                       // mΩ -> Ω
+}
 
 // I2C pins (ESP32-C3)
 #define I2C_SDA_PIN 3
@@ -67,7 +84,7 @@ NimBLECharacteristic* pDataChar = nullptr;
 String bleDeviceName;
 unsigned long lastConnectionTime = 0;
 unsigned long lastNotifyMillis = 0;
-unsigned long SendedDataRoutine = 2000; // 2 seconds
+unsigned long SendedDataRoutine = 2000; // Kirim Data tiap 2 detik
 
 // Adv / status animation
 uint8_t dotPhase = 0;
@@ -94,12 +111,7 @@ struct SensorReadings {
 };
 
 // ===== Averaging state =====
-// accumulate every loop; finalize each 1s; BLE sends avg of last two 1s windows every 2s
-struct Accum {
-  double v=0, i=0, t=0, h=0;
-  int n=0;
-} acc1s;
-
+struct Accum { double v=0, i=0, t=0, h=0; int n=0; } acc1s;
 SensorReadings avg1s_last = {0,0,0,0,false};
 SensorReadings avg1s_prev = {0,0,0,0,false};
 bool have1s = false;
@@ -113,7 +125,11 @@ SensorReadings getInstantReading();                 // returns ONE corrected sam
 void notifyAll(const SensorReadings& rd);
 void updateOLEDDisplay(const SensorReadings& rd);
 void drawBatteryBars(float percent);
-float estimateSOCpct(float packVolt);
+// ---- SoC helpers (NEW) ----
+float estimateSOCpct(float packVolt_meas);
+static float pack_ocv_from_vi(float v_meas_pack, float i_pack);
+static float soc_from_cell_ocv(float vcell);
+
 void drawCenteredBottom(const String& s);
 void print_wakeup_reason();
 void enterDeepSleep();
@@ -133,7 +149,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     Serial.printf("Central disconnected (handle=%d, reason=%d), total=%d\n",
-                  info.getConnHandle(), s->getConnectedCount());
+                  info.getConnHandle(), reason, s->getConnectedCount());
     NimBLEDevice::startAdvertising();
   }
 };
@@ -155,13 +171,15 @@ void setup() {
   pinMode(WAKE_UP_BUTTON_PIN, INPUT_PULLUP);
 
   lastConnectionTime = millis();
+
+  // Optionally allow entering OTA right after boot if held
   checkOTAToggle();
 
   Serial.println("Setup complete. Advertising...");
 }
 
 void loop() {
-  // Always watch for 5s hold to enter/exit OTA and drive header overlay
+  // Always watch for 5s hold to enter/exit OTA and drive overlay text
   checkOTAToggle();
 
   if (otaMode) {
@@ -174,6 +192,7 @@ void loop() {
     display.setCursor(0, 0);
     display.print("OTA MODE");
 
+    // Show overlay countdown if user is holding to EXIT
     if (overlayCountdown > 0) {
       String ov = "Exit-(" + String(overlayCountdown) + ")";
       int ox = SCREEN_WIDTH - (ov.length() * 6);
@@ -182,15 +201,20 @@ void loop() {
       display.print(ov);
     }
 
-    display.setCursor(0, 12); display.print("SSID: "); display.print(otaSSID);
-    display.setCursor(0, 24); display.print("PWD : "); display.print(OTA_PASSWORD);
-    display.setCursor(0, 36); display.print("IP  : "); display.print(otaIP == IPAddress(0,0,0,0) ? "192.168.4.1" : otaIP.toString());
-    display.setCursor(0, 48); display.print("Update via Arduino-IDE");
-    display.setCursor(0, 56); display.print("Net-PORT or espota.py");
+    display.setCursor(0, 12);
+    display.print("SSID: "); display.print(otaSSID);
+    display.setCursor(0, 24);
+    display.print("PWD : "); display.print(OTA_PASSWORD);
+    display.setCursor(0, 36);
+    display.print("IP  : "); display.print(otaIP == IPAddress(0,0,0,0) ? "192.168.4.1" : otaIP.toString());
+    display.setCursor(0, 46);
+    display.print("Update Via ArduinoIDE");
+    display.setCursor(0, 56);
+    display.print("Net-PORT or espota.py");
     display.display();
 
     delay(20);
-    return;  // stay awake in OTA
+    return;  // no deep sleep in OTA
   }
 
   // ---- 1) Take an instantaneous sample (corrected with offsets) ----
@@ -244,25 +268,32 @@ void loop() {
     }
   } else {
     // No connections: consider deep sleep after timeout (unless user is holding)
-    if (!holdInProgress && (now - lastConnectionTime > SLEEP_TIMEOUT_MS)) {
-      for (int i = 5; i > 0; --i) {
-        display.clearDisplay();
-        display.setTextColor(SSD1306_WHITE);
-        display.setTextSize(1);
-        display.setCursor(0, 0);
-        display.print(bleDeviceName);
-        display.setCursor(0, 12);
-        display.print("Sleeping in ");
-        display.print(i);
-        display.print("s");
-        display.display();
-        delay(1000);
-        if (pServer->getConnectedCount() > 0) break;
-      }
-      if (pServer->getConnectedCount() == 0) {
-        enterDeepSleep();
-      }
+if (!holdInProgress && (now - lastConnectionTime > SLEEP_TIMEOUT_MS)) {
+  bool canceled = runSleepCountdownCancelable(5);
+
+  if (canceled) {
+    // refresh idle timer so we postpone sleeping
+    lastConnectionTime = millis();
+
+    // brief "Canceled" toast
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print(bleDeviceName);
+    display.setCursor(0, 12);
+    display.print("Sleep canceled");
+    display.display();
+    delay(600);
+
+  } else {
+    // only sleep if still no connection and not in OTA hold
+    if ((pServer ? pServer->getConnectedCount() : 0) == 0 && !holdInProgress) {
+      enterDeepSleep();
     }
+  }
+}
+
   }
 
   delay(200);  // modest loop rate (~5 Hz sampling into 1s avg)
@@ -328,7 +359,7 @@ bool initializeHardware() {
     return false;
   }
 
-  // Configure INA226 (keep library offset 0; we apply our own in code)
+  // Configure INA226 (keep driver current offset = 0; we add manual offset later)
   int rc = ina226.configure(
     SHUNT_FOR_CAL,
     INA_LSB_mA_PRIMARY,
@@ -430,25 +461,66 @@ SensorReadings getInstantReading() {
 
 void notifyAll(const SensorReadings& rd) {
   if (!pDataChar || !rd.valid) return;
-
-  // EXACT format for the phone parser: v%.2fa%.2ft%.2fh%.1f
   char buf[128];
-  snprintf(buf, sizeof(buf),
-           "v%.2fa%.2ft%.2fh%.1f",
+  snprintf(buf, sizeof(buf), "v%.2fa%.2ft%.2fh%.1f",
            rd.voltage, rd.current, rd.temperature, rd.humidity);
-
   pDataChar->setValue((uint8_t*)buf, strlen(buf));
-  pDataChar->notify(); // to all subscribed centrals
+  pDataChar->notify();
 }
 
-float estimateSOCpct(float packVolt) {
-  float vcell = packVolt / SERIES_CELLS;
-  if (vcell <= PCELL_VMIN) return 0.0f;
-  if (vcell >= PCELL_VMAX) return 100.0f;
-  if (vcell <= PCELL_VNOM) {
-    return 50.0f * (vcell - PCELL_VMIN) / (PCELL_VNOM - PCELL_VMIN);
+// ===================== SoC (OCV-based) =====================
+
+// Typical NMC/NCA per-cell OCV (rested) vs SoC table (tune if you later get curves).
+// Voltage in V, SoC in %.
+struct OcvPoint { float v; float soc; };
+const OcvPoint OCV_LUT[] = {
+  {4.20f,100}, {4.15f,95}, {4.10f,90}, {4.05f,85},
+  {4.00f,80},  {3.96f,75}, {3.92f,70}, {3.88f,65},
+  {3.85f,60},  {3.82f,55}, {3.79f,50}, {3.76f,45},
+  {3.73f,40},  {3.70f,35}, {3.66f,30}, {3.62f,25},
+  {3.58f,20},  {3.54f,15}, {3.50f,10}, {3.45f,5},
+  {3.40f,3},   {3.30f,0}
+};
+const int OCV_LUT_N = sizeof(OCV_LUT)/sizeof(OCV_LUT[0]);
+
+static float soc_from_cell_ocv(float vcell) {
+  if (vcell >= OCV_LUT[0].v) return 100.0f;
+  if (vcell <= OCV_LUT[OCV_LUT_N-1].v) return 0.0f;
+  for (int i=0;i<OCV_LUT_N-1;i++) {
+    float v1 = OCV_LUT[i].v,   s1 = OCV_LUT[i].soc;
+    float v2 = OCV_LUT[i+1].v, s2 = OCV_LUT[i+1].soc;
+    if (vcell <= v1 && vcell >= v2) {
+      float t = (v1 - vcell) / (v1 - v2); // 0..1
+      return s1 + t * (s2 - s1);
+    }
   }
-  return 50.0f + 50.0f * (vcell - PCELL_VNOM) / (PCELL_VMAX - PCELL_VNOM);
+  return 0.0f;
+}
+
+// Compute OCV-compensated pack voltage from measured V and current (A).
+static float pack_ocv_from_vi(float v_meas_pack, float i_pack) {
+  // Convention: discharge current positive -> V_ocv = V_meas + I*R
+  return v_meas_pack + i_pack * R_PACK_OHM();
+}
+
+// Replace your old linear estimate with an OCV-based version + EMA smoothing.
+float estimateSOCpct(float packVolt_meas) {
+  extern SensorReadings avg1s_last;  // use 1s-avg current for compensation
+  float iA = avg1s_last.valid ? avg1s_last.current : 0.0f;
+
+  float v_ocv_pack = pack_ocv_from_vi(packVolt_meas, iA);
+  float vcell = v_ocv_pack / SERIES_CELLS;
+
+  float soc = soc_from_cell_ocv(vcell);
+
+  // EMA smoothing for display
+  static bool init=false;
+  static float soc_ema=0.0f;
+  if (!init) { soc_ema = soc; init = true; }
+  soc_ema = SOC_EMA_ALPHA * soc + (1.0f - SOC_EMA_ALPHA) * soc_ema;
+  if (soc_ema < 0.0f) soc_ema = 0.0f;
+  if (soc_ema > 100.0f) soc_ema = 100.0f;
+  return soc_ema;
 }
 
 // === Single long battery bar with % text ===
@@ -509,7 +581,7 @@ void updateOLEDDisplay(const SensorReadings& rd) {
     display.print(headerOverlay);
   }
 
-  // Battery bar
+  // Battery bar with OCV-compensated SoC
   float pct = rd.valid ? estimateSOCpct(rd.voltage) : 0.0f;
   drawBatteryBars(pct);
 
@@ -518,17 +590,17 @@ void updateOLEDDisplay(const SensorReadings& rd) {
   display.drawFastVLine(64, 18, 33, SSD1306_WHITE);
   display.drawFastHLine(0, 53, 128, SSD1306_WHITE);
 
-  // Left: V / A (use averaged values)
+  // Left: V / A (averaged values)
   display.setCursor(0, 25);
-  if (rd.valid) display.printf("V= %.2f V", rd.voltage); else display.print("V= --.--");
+  if (rd.valid) display.printf("V:%.2f V", rd.voltage); else display.print("V:--.--");
   display.setCursor(0, 37);
-  if (rd.valid) display.printf("A= %.2f A", rd.current); else display.print("A= --.--");
+  if (rd.valid) display.printf("A:%.2f A", rd.current); else display.print("A:--.--");
 
-  // Right: T / H
+  // Right: T / H  ℃
   display.setCursor(67, 25);
-  if (rd.valid) display.printf("T= %.2f C", rd.temperature); else display.print("T= --.--");
+  if (rd.valid){ display.printf("T:%.2f ", rd.temperature);display.print((char)247);display.print("C");} else { display.print("T:--.-"); }
   display.setCursor(68, 37);
-  if (rd.valid) display.printf("H= %.1f%%RH", rd.humidity); else display.print("H= --.--");
+  if (rd.valid) display.printf("H:%.1f %%RH", rd.humidity); else display.print("H:--.-");
 
   // Bottom centered status (animated)
   const int connCount = pServer ? pServer->getConnectedCount() : 0;
@@ -572,6 +644,52 @@ void print_wakeup_reason() {
   }
 }
 
+// Cancelable "sleeping in N..." countdown that polls the button frequently.
+// Returns true if user canceled, false if countdown completed.
+bool runSleepCountdownCancelable(int seconds) {
+  for (int i = seconds; i > 0; --i) {
+    // draw one frame
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print(bleDeviceName);
+    display.setCursor(0, 12);
+    display.print("Sleeping in ");
+    display.print(i);
+    display.print("s");
+    display.display();
+
+    // poll for up to 1000 ms with debounce and OTA suppression
+    unsigned long until = millis() + 1000;
+    bool debouncedLow = false;
+    unsigned long lowSince = 0;
+
+    while ((long)(until - millis()) > 0) {
+      // If user presses the wake button (active-LOW), cancel
+      int pin = digitalRead(WAKE_UP_BUTTON_PIN);
+      if (pin == LOW) {
+        if (!debouncedLow) { debouncedLow = true; lowSince = millis(); }
+        // simple 30 ms debounce
+        if (millis() - lowSince >= 30) {
+          // Cancel the countdown
+          // (do NOT trigger OTA toggle here; short press just cancels)
+          return true;
+        }
+      } else {
+        debouncedLow = false;
+      }
+
+      // If a central connected during countdown, abort too
+      if (pServer && pServer->getConnectedCount() > 0) return true;
+
+      delay(20);
+    }
+  }
+  return false; // countdown reached 0
+}
+
+
 void enterDeepSleep() {
   Serial.println("Entering deep sleep...");
 
@@ -584,12 +702,15 @@ void enterDeepSleep() {
   esp_sleep_enable_timer_wakeup((uint64_t)WAKE_INTERVAL_MS * 1000ULL);
 
 #if USE_EXT0_WAKEUP
+  // EXT0 (if you really need it)
   esp_deep_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_UP_BUTTON_PIN, 1);
   gpio_pullup_dis((gpio_num_t)WAKE_UP_BUTTON_PIN);
   gpio_pulldown_en((gpio_num_t)WAKE_UP_BUTTON_PIN);
 #else
+  // *** C3 GPIO wake: wake when button pulls pin LOW ***
   uint64_t mask = (1ULL << WAKE_UP_BUTTON_PIN);
   esp_deep_sleep_enable_gpio_wakeup(mask, ESP_GPIO_WAKEUP_GPIO_LOW);
+  // Hold pin HIGH during sleep so it doesn't instantly wake
   gpio_pullup_en((gpio_num_t)WAKE_UP_BUTTON_PIN);
   gpio_pulldown_dis((gpio_num_t)WAKE_UP_BUTTON_PIN);
 #endif
@@ -599,10 +720,7 @@ void enterDeepSleep() {
 
 // ================== OTA HELPERS ==================
 
-String twoDigit(int n) {
-  if (n < 10) return "0" + String(n);
-  return String(n);
-}
+String twoDigit(int n) { if (n < 10) return "0" + String(n); return String(n); }
 
 void startOTA_AP_Mode() {
   if (otaMode) return;
@@ -645,6 +763,7 @@ void stopOTA_AP_Mode() {
 }
 
 void checkOTAToggle() {
+  // Button is active-LOW (to GND). Show overlay "ROM-(4..1)" for last 4s of hold.
   int pin = digitalRead(WAKE_UP_BUTTON_PIN);
   unsigned long now = millis();
 
@@ -657,19 +776,23 @@ void checkOTAToggle() {
       unsigned long held = now - holdStartMs;
       long remain = (long)OTA_HOLD_MS - (long)held;
       int show = (remain > 0) ? ((remain + 999) / 1000) : 0; // ceil
-      if (show > 4) show = 4; if (show < 0) show = 0;
+      if (show > 4) show = 4;   // clamp to 4..1
+      if (show < 0) show = 0;
       overlayCountdown = show;
 
       if (held >= OTA_HOLD_MS) {
+        // Toggle OTA mode
         if (otaMode) stopOTA_AP_Mode();
         else startOTA_AP_Mode();
 
+        // prevent rapid retrigger; wait for release
         while (digitalRead(WAKE_UP_BUTTON_PIN) == LOW) { delay(10); }
         holdInProgress = false;
         overlayCountdown = -1;
       }
     }
   } else {
+    // Released
     holdInProgress = false;
     overlayCountdown = -1;
   }
