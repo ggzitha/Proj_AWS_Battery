@@ -14,7 +14,7 @@
 #include <ArduinoOTA.h>
 
 // ===================== CONFIG =====================
-#define DEVICE_NUM              4          // 4 / 5 / 6 -> used in names
+#define DEVICE_NUM              6          // 4 / 5 / 6 -> used in names
 #define WAKE_UP_BUTTON_PIN      2          // Button to GND; we use pull-up and wake on LOW
 #define USE_EXT0_WAKEUP         0          // Keep 0 (EXT1/GPIO wake) on C3
 
@@ -24,16 +24,20 @@
 
 // BMS estimate for OLED bars (app does precise logic)
 #define SERIES_CELLS            4
-#define PCELL_VMIN              2.80f
-#define PCELL_VNOM              3.65f
+#define PCELL_VMIN              2.75f
+#define PCELL_VNOM              3.60f
 #define PCELL_VMAX              4.20f
 
 // ---- INA226 / SHUNT CONFIG ----
 #define SHUNT_FOR_CAL           0.00621f   // refined shunt (Ohm)
 #define INA_LSB_mA_PRIMARY      0.625f
 #define INA_LSB_mA_FALLBACK     1.000f
-#define INA_I_OFFSET_mA         0.0f
+#define INA_I_OFFSET_mA_CFG     0.0f       // keep 0; we apply our own offset below
 #define INA_V_SCALE_E4          10000
+
+// ===== User calibration offsets (apply AFTER sensor read) =====
+#define V_OFFSET_mV             0.0f       // add/subtract voltage in millivolts (e.g. +25.0f)
+#define I_OFFSET_mA             0.0f       // add/subtract current in milliamps (e.g. -5.0f)
 
 // I2C pins (ESP32-C3)
 #define I2C_SDA_PIN 3
@@ -63,7 +67,7 @@ NimBLECharacteristic* pDataChar = nullptr;
 String bleDeviceName;
 unsigned long lastConnectionTime = 0;
 unsigned long lastNotifyMillis = 0;
-unsigned long SendedDataRoutine = 2000; // Kirim Data tiap 2 detik
+unsigned long SendedDataRoutine = 2000; // 2 seconds
 
 // Adv / status animation
 uint8_t dotPhase = 0;
@@ -78,21 +82,34 @@ IPAddress otaIP(0,0,0,0);
 bool holdInProgress = false;
 unsigned long holdStartMs = 0;
 int overlayCountdown = -1;          // -1 = no overlay
-String headerOverlay = "";          // "Update(4)" ... "Update(1)"
+String headerOverlay = "";          // "ROM-(4)" ... "ROM-(1)"
 
-// ======== Define SensorReadings BEFORE prototypes (fix) ========
+// ======== Define SensorReadings BEFORE prototypes ========
 struct SensorReadings {
-  float temperature;
-  float current;   // A
-  float voltage;   // V
-  float humidity;  // %RH
-  bool valid;
+  float temperature;  // C
+  float current;      // A
+  float voltage;      // V
+  float humidity;     // %RH
+  bool  valid;
 };
+
+// ===== Averaging state =====
+// accumulate every loop; finalize each 1s; BLE sends avg of last two 1s windows every 2s
+struct Accum {
+  double v=0, i=0, t=0, h=0;
+  int n=0;
+} acc1s;
+
+SensorReadings avg1s_last = {0,0,0,0,false};
+SensorReadings avg1s_prev = {0,0,0,0,false};
+bool have1s = false;
+bool have2s = false;
+unsigned long lastOLEDms = 0;
 
 // ======== Prototypes ========
 bool initializeHardware();
 void initializeBLE();
-SensorReadings getSensorReadings();
+SensorReadings getInstantReading();                 // returns ONE corrected sample
 void notifyAll(const SensorReadings& rd);
 void updateOLEDDisplay(const SensorReadings& rd);
 void drawBatteryBars(float percent);
@@ -102,10 +119,10 @@ void print_wakeup_reason();
 void enterDeepSleep();
 void scanI2C();
 
-void checkOTAToggle();        // NEW: handle 5s hold & overlay text
-void startOTA_AP_Mode();      // NEW
-void stopOTA_AP_Mode();       // NEW
-String twoDigit(int n);       // NEW
+void checkOTAToggle();
+void startOTA_AP_Mode();
+void stopOTA_AP_Mode();
+String twoDigit(int n);
 
 // ================== BLE CALLBACKS ==================
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -116,7 +133,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     Serial.printf("Central disconnected (handle=%d, reason=%d), total=%d\n",
-                  info.getConnHandle(), reason, s->getConnectedCount());
+                  info.getConnHandle(), s->getConnectedCount());
     NimBLEDevice::startAdvertising();
   }
 };
@@ -138,15 +155,13 @@ void setup() {
   pinMode(WAKE_UP_BUTTON_PIN, INPUT_PULLUP);
 
   lastConnectionTime = millis();
-
-  // Optionally allow entering OTA right after boot if held
   checkOTAToggle();
 
   Serial.println("Setup complete. Advertising...");
 }
 
 void loop() {
-  // Always watch for 5s hold to enter/exit OTA and drive overlay text
+  // Always watch for 5s hold to enter/exit OTA and drive header overlay
   checkOTAToggle();
 
   if (otaMode) {
@@ -159,9 +174,7 @@ void loop() {
     display.setCursor(0, 0);
     display.print("OTA MODE");
 
-    // Show overlay countdown if user is holding to EXIT
     if (overlayCountdown > 0) {
-      // right-aligned overlay on header line
       String ov = "Exit-(" + String(overlayCountdown) + ")";
       int ox = SCREEN_WIDTH - (ov.length() * 6);
       if (ox < 0) ox = 0;
@@ -169,42 +182,69 @@ void loop() {
       display.print(ov);
     }
 
-    display.setCursor(0, 12);
-    display.print("SSID: ");
-    display.print(otaSSID);
-    display.setCursor(0, 24);
-    display.print("PWD : ");
-    display.print(OTA_PASSWORD);
-    display.setCursor(0, 36);
-    display.print("IP  : ");
-    if (otaIP == IPAddress(0,0,0,0)) display.print("192.168.4.1");
-    else display.print(otaIP);
-    display.setCursor(0, 48);
-    display.print("Update via Arduino-IDE");
-    display.setCursor(0, 56);
-    display.print("Net-PORT or espota.py");
+    display.setCursor(0, 12); display.print("SSID: "); display.print(otaSSID);
+    display.setCursor(0, 24); display.print("PWD : "); display.print(OTA_PASSWORD);
+    display.setCursor(0, 36); display.print("IP  : "); display.print(otaIP == IPAddress(0,0,0,0) ? "192.168.4.1" : otaIP.toString());
+    display.setCursor(0, 48); display.print("Update via Arduino-IDE");
+    display.setCursor(0, 56); display.print("Net-PORT or espota.py");
     display.display();
 
     delay(20);
-    return;  // no deep sleep in OTA
+    return;  // stay awake in OTA
   }
 
+  // ---- 1) Take an instantaneous sample (corrected with offsets) ----
+  SensorReadings samp = getInstantReading();
+  if (samp.valid) {
+    acc1s.v += samp.voltage;
+    acc1s.i += samp.current;
+    acc1s.t += samp.temperature;
+    acc1s.h += samp.humidity;
+    acc1s.n += 1;
+  }
+
+  // ---- 2) On each 1-second boundary, finalize OLED average ----
+  unsigned long now = millis();
+  if (now - lastOLEDms >= 1000) {
+    lastOLEDms = now;
+
+    if (acc1s.n > 0) {
+      avg1s_prev = avg1s_last;
+      avg1s_last.temperature = (float)(acc1s.t / acc1s.n);
+      avg1s_last.current     = (float)(acc1s.i / acc1s.n);
+      avg1s_last.voltage     = (float)(acc1s.v / acc1s.n);
+      avg1s_last.humidity    = (float)(acc1s.h / acc1s.n);
+      avg1s_last.valid       = true;
+      have2s = have1s;    // becomes true after second 1s window
+      have1s = true;
+
+      // reset accumulator for next second
+      acc1s = Accum{};
+    }
+
+    // Update OLED once per second with the 1s average
+    if (avg1s_last.valid) updateOLEDDisplay(avg1s_last);
+  }
+
+  // ---- 3) BLE notify every 2s with mean of last two 1s windows ----
   const int connCount = pServer ? pServer->getConnectedCount() : 0;
-
-  // Read sensors periodically for OLED + notifications
-  SensorReadings readings = getSensorReadings();
-
   if (connCount > 0) {
-    lastConnectionTime = millis();
+    lastConnectionTime = now;
+    if (have2s && (now - lastNotifyMillis >= SendedDataRoutine)) {
+      lastNotifyMillis = now;
 
-    // Throttle BLE notify
-    if (millis() - lastNotifyMillis >= SendedDataRoutine) {
-      lastNotifyMillis = millis();
-      if (readings.valid) notifyAll(readings);
+      SensorReadings bleAvg;
+      bleAvg.valid       = true;
+      bleAvg.voltage     = (avg1s_last.voltage + avg1s_prev.voltage) * 0.5f;
+      bleAvg.current     = (avg1s_last.current + avg1s_prev.current) * 0.5f;
+      bleAvg.temperature = (avg1s_last.temperature + avg1s_prev.temperature) * 0.5f;
+      bleAvg.humidity    = (avg1s_last.humidity + avg1s_prev.humidity) * 0.5f;
+
+      notifyAll(bleAvg);
     }
   } else {
     // No connections: consider deep sleep after timeout (unless user is holding)
-    if (!holdInProgress && (millis() - lastConnectionTime > SLEEP_TIMEOUT_MS)) {
+    if (!holdInProgress && (now - lastConnectionTime > SLEEP_TIMEOUT_MS)) {
       for (int i = 5; i > 0; --i) {
         display.clearDisplay();
         display.setTextColor(SSD1306_WHITE);
@@ -225,10 +265,7 @@ void loop() {
     }
   }
 
-  // Update OLED with current state (smooth UI refresh)
-  updateOLEDDisplay(readings);
-
-  delay(200);  // modest loop rate
+  delay(200);  // modest loop rate (~5 Hz sampling into 1s avg)
 }
 
 // ================== IMPLEMENTATION ==================
@@ -291,10 +328,11 @@ bool initializeHardware() {
     return false;
   }
 
+  // Configure INA226 (keep library offset 0; we apply our own in code)
   int rc = ina226.configure(
     SHUNT_FOR_CAL,
     INA_LSB_mA_PRIMARY,
-    INA_I_OFFSET_mA,
+    INA_I_OFFSET_mA_CFG,
     INA_V_SCALE_E4
   );
   if (rc != 0) {
@@ -302,7 +340,7 @@ bool initializeHardware() {
     rc = ina226.configure(
       SHUNT_FOR_CAL,
       INA_LSB_mA_FALLBACK,
-      INA_I_OFFSET_mA,
+      INA_I_OFFSET_mA_CFG,
       INA_V_SCALE_E4
     );
     if (rc != 0) {
@@ -367,16 +405,24 @@ void initializeBLE() {
   Serial.printf("Advertising as %s\n", bleDeviceName.c_str());
 }
 
-SensorReadings getSensorReadings() {
+// ---- Take one corrected sample (offsets applied) ----
+SensorReadings getInstantReading() {
   SensorReadings r;
   r.valid = false;
 
   sensors_event_t humidity, temp;
   if (aht.getEvent(&humidity, &temp)) {
+    float v  = ina226.getBusVoltage();          // V
+    float im = ina226.getCurrent_mA();          // mA
+
+    // Apply user offsets (post-read)
+    v  += (V_OFFSET_mV / 1000.0f);
+    im += I_OFFSET_mA;
+
     r.temperature = temp.temperature;
     r.humidity    = humidity.relative_humidity;
-    r.voltage     = ina226.getBusVoltage();          // V
-    r.current     = ina226.getCurrent_mA() / 1000.0; // A
+    r.voltage     = v;
+    r.current     = im / 1000.0f;               // A
     r.valid       = true;
   }
   return r;
@@ -396,7 +442,6 @@ void notifyAll(const SensorReadings& rd) {
 }
 
 float estimateSOCpct(float packVolt) {
-  // Simple piecewise Min -> Nom -> Max (OLED only)
   float vcell = packVolt / SERIES_CELLS;
   if (vcell <= PCELL_VMIN) return 0.0f;
   if (vcell >= PCELL_VMAX) return 100.0f;
@@ -406,33 +451,27 @@ float estimateSOCpct(float packVolt) {
   return 50.0f + 50.0f * (vcell - PCELL_VNOM) / (PCELL_VMAX - PCELL_VNOM);
 }
 
+// === Single long battery bar with % text ===
 void drawBatteryBars(float percent) {
-  // Clamp
   if (percent < 0.0f)  percent = 0.0f;
   if (percent > 100.0f) percent = 100.0f;
 
-  // Bar geometry (leaves space on the right for "100%")
   const int barX = 0;
   const int barY = 9;
-  const int barW = 100;  // 100px bar + 4px gap + up to 24px text = 128px total
+  const int barW = 100;
   const int barH = 8;
 
-  // Outline
   display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
 
-  // Fill (inner, so it doesn't overwrite the outline)
   int fillW = (int)((barW - 2) * (percent / 100.0f) + 0.5f);
-  if (fillW > 0) {
-    display.fillRect(barX + 1, barY + 1, fillW, barH - 2, SSD1306_WHITE);
-  }
+  if (fillW > 0) display.fillRect(barX + 1, barY + 1, fillW, barH - 2, SSD1306_WHITE);
 
-  // Percentage text at the end of the bar
   int ipct = (int)(percent + 0.5f);
   char buf[8];
   snprintf(buf, sizeof(buf), "%d%%", ipct);
 
-  int textX = barX + barW + 4;  // 4px gap after the bar
-  int textY = barY;             // top-aligned with the bar; looks good with size=1
+  int textX = barX + barW + 4;
+  int textY = barY;
 
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -440,9 +479,7 @@ void drawBatteryBars(float percent) {
   display.print(buf);
 }
 
-
 void drawCenteredBottom(const String& s) {
-  // Approx width ~6 px per char with default font
   int w = s.length() * 6;
   int x = (SCREEN_WIDTH - w) / 2;
   int y = 55;
@@ -463,20 +500,16 @@ void updateOLEDDisplay(const SensorReadings& rd) {
   display.setCursor(0, 0);
   display.print(bleDeviceName);
 
-  // Header overlay (right): "Update(4..1)" while holding
+  // Header overlay (right)
   if (overlayCountdown > 0) {
     headerOverlay = "ROM-(" + String(overlayCountdown) + ")";
-  } else {
-    headerOverlay = "";
-  }
-  if (headerOverlay.length() > 0) {
     int ox = SCREEN_WIDTH - (headerOverlay.length() * 6);
     if (ox < 0) ox = 0;
     display.setCursor(ox, 0);
     display.print(headerOverlay);
   }
 
-  // Battery bars (top)
+  // Battery bar
   float pct = rd.valid ? estimateSOCpct(rd.voltage) : 0.0f;
   drawBatteryBars(pct);
 
@@ -485,7 +518,7 @@ void updateOLEDDisplay(const SensorReadings& rd) {
   display.drawFastVLine(64, 18, 33, SSD1306_WHITE);
   display.drawFastHLine(0, 53, 128, SSD1306_WHITE);
 
-  // Left: V / A
+  // Left: V / A (use averaged values)
   display.setCursor(0, 25);
   if (rd.valid) display.printf("V= %.2f V", rd.voltage); else display.print("V= --.--");
   display.setCursor(0, 37);
@@ -497,7 +530,7 @@ void updateOLEDDisplay(const SensorReadings& rd) {
   display.setCursor(68, 37);
   if (rd.valid) display.printf("H= %.1f%%RH", rd.humidity); else display.print("H= --.--");
 
-  // Bottom centered status
+  // Bottom centered status (animated)
   const int connCount = pServer ? pServer->getConnectedCount() : 0;
   String status;
   if (connCount > 0) {
@@ -531,7 +564,6 @@ void print_wakeup_reason() {
     case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup: TOUCH"); break;
     case ESP_SLEEP_WAKEUP_ULP: Serial.println("Wakeup: ULP"); break;
     case ESP_SLEEP_WAKEUP_GPIO: {
-      // FIX: use esp_sleep_get_gpio_wakeup_status() on IDF v5
       uint64_t m = esp_sleep_get_gpio_wakeup_status();
       Serial.printf("Wakeup: GPIO (mask=0x%llX)\n", (unsigned long long)m);
       break;
@@ -552,15 +584,12 @@ void enterDeepSleep() {
   esp_sleep_enable_timer_wakeup((uint64_t)WAKE_INTERVAL_MS * 1000ULL);
 
 #if USE_EXT0_WAKEUP
-  // EXT0 (if you really need it)
   esp_deep_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_UP_BUTTON_PIN, 1);
   gpio_pullup_dis((gpio_num_t)WAKE_UP_BUTTON_PIN);
   gpio_pulldown_en((gpio_num_t)WAKE_UP_BUTTON_PIN);
 #else
-  // *** C3 GPIO wake: wake when button pulls pin LOW ***
   uint64_t mask = (1ULL << WAKE_UP_BUTTON_PIN);
   esp_deep_sleep_enable_gpio_wakeup(mask, ESP_GPIO_WAKEUP_GPIO_LOW);
-  // Hold pin HIGH during sleep so it doesn't instantly wake
   gpio_pullup_en((gpio_num_t)WAKE_UP_BUTTON_PIN);
   gpio_pulldown_dis((gpio_num_t)WAKE_UP_BUTTON_PIN);
 #endif
@@ -616,7 +645,6 @@ void stopOTA_AP_Mode() {
 }
 
 void checkOTAToggle() {
-  // Button is active-LOW (to GND). Show overlay "Update(4..1)" for last 4s of hold.
   int pin = digitalRead(WAKE_UP_BUTTON_PIN);
   unsigned long now = millis();
 
@@ -629,25 +657,19 @@ void checkOTAToggle() {
       unsigned long held = now - holdStartMs;
       long remain = (long)OTA_HOLD_MS - (long)held;
       int show = (remain > 0) ? ((remain + 999) / 1000) : 0; // ceil
-      if (show > 4) show = 4;   // clamp to 4..1
-      if (show < 0) show = 0;
+      if (show > 4) show = 4; if (show < 0) show = 0;
       overlayCountdown = show;
 
       if (held >= OTA_HOLD_MS) {
-        // Toggle OTA mode
         if (otaMode) stopOTA_AP_Mode();
         else startOTA_AP_Mode();
 
-        // prevent rapid retrigger; wait for release
-        while (digitalRead(WAKE_UP_BUTTON_PIN) == LOW) {
-          delay(10);
-        }
+        while (digitalRead(WAKE_UP_BUTTON_PIN) == LOW) { delay(10); }
         holdInProgress = false;
         overlayCountdown = -1;
       }
     }
   } else {
-    // Released
     holdInProgress = false;
     overlayCountdown = -1;
   }
