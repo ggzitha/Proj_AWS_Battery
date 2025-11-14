@@ -52,7 +52,7 @@
 // LiitoKala spec: internal resistance <17 mΩ / cell
 #define R_CELL_mOHM             17.0f      // per cell
 #define R_EXTRA_mOHM            60.0f      // BMS FETs + shunt + wiring (tune)
-#define SOC_EMA_ALPHA           0.25f      // 0..1; higher = snappier, lower = smoother
+#define SOC_EMA_ALPHA           0.30f      // 0..1; higher = snappier, lower = smoother
 
 static float R_PACK_OHM() {
   float groupResistance_mOhm   = R_CELL_mOHM / PARALLEL_CELLS;         // mΩ per parallel group
@@ -402,9 +402,9 @@ bool initializeHardware() {
     }
   }
 
-  ina226.setAverage(INA226_1024_SAMPLES);
-  ina226.setBusVoltageConversionTime(7);
-  ina226.setShuntVoltageConversionTime(7);
+  ina226.setAverage(INA226_128_SAMPLES);
+  ina226.setBusVoltageConversionTime(INA226_2100_us);
+  ina226.setShuntVoltageConversionTime(INA226_2100_us);
   ina226.setMode(7); // continuous shunt+bus
 
   // BLE name (also used in header)
