@@ -14,7 +14,7 @@
 #include <ArduinoOTA.h>
 
 // ===================== CONFIG =====================
-#define DEVICE_NUM              5          // 4 / 5 / 6 -> used in names
+#define DEVICE_NUM              6          // 4 / 5 / 6 -> used in names
 #define WAKE_UP_BUTTON_PIN      2          // Button to GND; we use pull-up and wake on LOW
 #define USE_EXT0_WAKEUP         0          // Keep 0 (EXT1/GPIO wake) on C3
 
@@ -29,6 +29,14 @@
 #define PCELL_VMIN              2.70f
 #define PCELL_VNOM              3.60f
 #define PCELL_VMAX              4.20f
+
+// Kapasitas per sel (default 3400 mAh, sesuaikan dengan pack kamu)
+#define PCELL_CAPACITY_mAh      4000.0f
+
+// Kapasitas pack total (Ah) = kapasitas per sel * parallel
+static float PACK_CAPACITY_Ah() {
+  return (PCELL_CAPACITY_mAh * PARALLEL_CELLS) / 1000.0f;
+}
 
 // ---- INA226 / SHUNT CONFIG ----
 // shunt (Ohm). Lower shunt = higher measurement range, lower resolution.
@@ -50,15 +58,15 @@
 
 // ===== Load compensation + smoothing (SoC under load) =====
 // LiitoKala spec: internal resistance <17 mΩ / cell
-#define R_CELL_mOHM             17.0f      // per cell
+#define R_CELL_mOHM             18.0f      // per cell
 #define R_EXTRA_mOHM            60.0f      // BMS FETs + shunt + wiring (tune)
 #define SOC_EMA_ALPHA           0.30f      // 0..1; higher = snappier, lower = smoother
 
 static float R_PACK_OHM() {
-  float groupResistance_mOhm   = R_CELL_mOHM / PARALLEL_CELLS;         // mΩ per parallel group
-  float seriesStack_mOhm       = groupResistance_mOhm * SERIES_CELLS;  // mΩ for 4S stack
-  float totalPackResistance_mOhm = seriesStack_mOhm + R_EXTRA_mOHM;    // mΩ incl. wiring/BMS
-  return totalPackResistance_mOhm / 1000.0f;                           // Ω
+  float groupResistance_mOhm     = R_CELL_mOHM / PARALLEL_CELLS;         // mΩ per parallel group
+  float seriesStack_mOhm         = groupResistance_mOhm * SERIES_CELLS;  // mΩ for 4S stack
+  float totalPackResistance_mOhm = seriesStack_mOhm + R_EXTRA_mOHM;      // mΩ incl. wiring/BMS
+  return totalPackResistance_mOhm / 1000.0f;                             // Ω
 }
 
 // I2C pins (ESP32-C3)
@@ -85,12 +93,12 @@ static NimBLEUUID SERVICE_UUID("91bad492-b950-4226-aa2b-4ede9fa42f59");
 static NimBLEUUID CHAR_UUID   ("cba1d466-344c-4be3-ab3f-189daa0a16d8");
 
 // BLE globals
-NimBLEServer*        bleServer            = nullptr;
+NimBLEServer*         bleServer             = nullptr;
 NimBLECharacteristic* bleDataCharacteristic = nullptr;
-String               bleDeviceName;
-unsigned long        lastConnectionTimeMs = 0;
-unsigned long        lastNotifyMillis     = 0;
-unsigned long        notifyIntervalMs     = 2000;   // Kirim Data tiap 2 detik
+String                bleDeviceName;
+unsigned long         lastConnectionTimeMs  = 0;
+unsigned long         lastNotifyMillis      = 0;
+unsigned long         notifyIntervalMs      = 2000;   // Kirim Data tiap 2 detik
 
 // Adv / status animation
 uint8_t       dotPhase      = 0;
@@ -133,28 +141,36 @@ bool           have1sWindow   = false;
 bool           have2sWindow   = false;
 unsigned long  lastOLEDms     = 0;
 
+// ===== Coulomb Counting state (integrasi arus) =====
+double        coulombAccumulatedAh = 0.0;   // Ah netto sejak anchor
+unsigned long lastCoulombMs        = 0;     // timestamp terakhir update CC
+bool          coulombInitialized   = false; // sudah pernah di-anchor?
+float         coulombBaseSocPct    = 50.0f; // SoC anchor dari OCV pertama kali
+
 // ======== Prototypes ========
-bool initializeHardware();
-void initializeBLE();
-SensorReadings getInstantReading();                 // returns ONE corrected sample
-void notifyAll(const SensorReadings& readings);
-void updateOLEDDisplay(const SensorReadings& readings);
-void drawBatteryBars(float percent);
+bool            initializeHardware();
+void            initializeBLE();
+SensorReadings  getInstantReading();
+void            notifyAll(const SensorReadings& readings);
+void            updateOLEDDisplay(const SensorReadings& readings);
+void            drawBatteryBars(float percent);
 // ---- SoC helpers ----
-float estimateSOCpct(float measuredPackVoltageV);
-static float pack_ocv_from_vi(float measuredPackVoltageV, float packCurrentA);
-static float soc_from_cell_ocv(float cellVoltageV);
+float           estimateSOCpct(float measuredPackVoltageV);
+static float    pack_ocv_from_vi(float measuredPackVoltageV, float packCurrentA);
+static float    soc_from_cell_ocv(float cellVoltageV);
+void            updateCoulombCounting(const SensorReadings& readings);
+float           soc_from_coulomb(float socOcv);
 
-void drawCenteredBottom(const String& text);
-void print_wakeup_reason();
-void enterDeepSleep();
-void scanI2C();
+void            drawCenteredBottom(const String& text);
+void            print_wakeup_reason();
+void            enterDeepSleep();
+void            scanI2C();
 
-void checkOTAToggle();
-void startOTA_AP_Mode();
-void stopOTA_AP_Mode();
-String twoDigit(int n);
-bool runSleepCountdownCancelable(int seconds);
+void            checkOTAToggle();
+void            startOTA_AP_Mode();
+void            stopOTA_AP_Mode();
+String          twoDigit(int n);
+bool            runSleepCountdownCancelable(int seconds);
 
 // ================== BLE CALLBACKS ==================
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -187,6 +203,7 @@ void setup() {
   pinMode(WAKE_UP_BUTTON_PIN, INPUT_PULLUP);
 
   lastConnectionTimeMs = millis();
+  lastCoulombMs        = millis();   // inisialisasi timestamp CC
 
   // Optionally allow entering OTA right after boot if held
   checkOTAToggle();
@@ -262,6 +279,9 @@ void loop() {
       have2sWindow = have1sWindow;    // becomes true after second window
       have1sWindow = true;
 
+      // ====== UPDATE COULOMB COUNTING (pakai rata-rata window) ======
+      updateCoulombCounting(averagedLast);
+
       // reset accumulator for next window
       acc1s = AccumulatedSums{};
     }
@@ -285,7 +305,7 @@ void loop() {
       bleAverage.currentA        = (averagedLast.currentA     + averagedPrev.currentA)     * 0.5f;
       bleAverage.temperatureC    = (averagedLast.temperatureC + averagedPrev.temperatureC) * 0.5f;
       bleAverage.humidityPercent = (averagedLast.humidityPercent + averagedPrev.humidityPercent) * 0.5f;
-      // power not sent over BLE yet; packet format unchanged
+      bleAverage.powerW          = (averagedLast.powerW       + averagedPrev.powerW)       * 0.5f;
 
       notifyAll(bleAverage);
     }
@@ -402,7 +422,7 @@ bool initializeHardware() {
     }
   }
 
-  ina226.setAverage(INA226_128_SAMPLES);
+  ina226.setAverage(INA226_64_SAMPLES);
   ina226.setBusVoltageConversionTime(INA226_2100_us);
   ina226.setShuntVoltageConversionTime(INA226_2100_us);
   ina226.setMode(7); // continuous shunt+bus
@@ -417,7 +437,7 @@ bool initializeHardware() {
 void initializeBLE() {
   NimBLEDevice::init(bleDeviceName.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // optional
-  NimBLEDevice::setMTU(185);                // optional
+  NimBLEDevice::setMTU(256);                // optional
 
   bleServer = NimBLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
@@ -498,58 +518,122 @@ void notifyAll(const SensorReadings& readings) {
   bleDataCharacteristic->notify();
 }
 
-// ===================== SoC (OCV-based) =====================
+// ===================== Coulomb Counting =====================
+// Asumsi: currentA positif = DISCHARGE (baterai mengeluarkan arus).
+// Kalau arah arus ternyata kebalik di hardware, ganti sign di sini.
 
-struct OcvPoint { float voltageV; float socPercent; };
-const OcvPoint OCV_LUT[] = {
-  {4.20f,100},  // truly full
-  {4.17f,96},   // ~16.68 V on 4S -> 96%
-  {4.10f,90},
-  {4.05f,85},
-  {4.00f,80},  {3.96f,75}, {3.92f,70}, {3.88f,65},
-  {3.85f,60},  {3.82f,55}, {3.79f,50}, {3.76f,45},
-  {3.73f,40},  {3.70f,35}, {3.66f,30}, {3.62f,25},
-  {3.58f,20},  {3.54f,15}, {3.50f,10}, {3.45f,5},
-  {3.40f,3},   {3.30f,0}
-};
-const int OCV_LUT_N = sizeof(OCV_LUT)/sizeof(OCV_LUT[0]);
+void updateCoulombCounting(const SensorReadings& readings) {
+  if (!readings.valid) return;
 
-static float soc_from_cell_ocv(float cellVoltageV) {
-  if (cellVoltageV >= OCV_LUT[0].voltageV) return 100.0f;
-  if (cellVoltageV <= OCV_LUT[OCV_LUT_N-1].voltageV) return 0.0f;
-  for (int index=0; index<OCV_LUT_N-1; index++) {
-    float v1 = OCV_LUT[index].voltageV;
-    float s1 = OCV_LUT[index].socPercent;
-    float v2 = OCV_LUT[index+1].voltageV;
-    float s2 = OCV_LUT[index+1].socPercent;
-    if (cellVoltageV <= v1 && cellVoltageV >= v2) {
-      float fraction = (v1 - cellVoltageV) / (v1 - v2); // 0..1
-      return s1 + fraction * (s2 - s1);
-    }
+  unsigned long nowMs = millis();
+  if (lastCoulombMs == 0) {
+    lastCoulombMs = nowMs;
+    return;
   }
-  return 0.0f;
+
+  float dtSec = (nowMs - lastCoulombMs) / 1000.0f;
+  lastCoulombMs = nowMs;
+
+  if (dtSec <= 0.0f) return;
+
+  float packCurrentA = readings.currentA;
+
+  // NOTE: kalau SoC malah naik ketika discharge, ganti:
+  // float packCurrentA = -readings.currentA;
+
+  float deltaAh = (packCurrentA * dtSec) / 3600.0f;  // Ah dalam dt
+  coulombAccumulatedAh += deltaAh;
 }
 
+// SoC relatif dari Coulomb Counting, anchored ke SoC OCV saat pertama dipakai
+float soc_from_coulomb(float socOcv) {
+  float capAh = PACK_CAPACITY_Ah();
+  if (capAh <= 0.01f) return socOcv;  // fallback ke OCV kalau kapasitas aneh
+
+  if (!coulombInitialized) {
+    // Pertama kali dipanggil: anchor coulomb ke SoC OCV saat itu
+    coulombBaseSocPct    = socOcv;
+    coulombAccumulatedAh = 0.0;
+    coulombInitialized   = true;
+  }
+
+  float deltaSocPct = (float)(coulombAccumulatedAh / capAh) * 100.0f;
+  float soc = coulombBaseSocPct + deltaSocPct;
+
+  if (soc < 0.0f)   soc = 0.0f;
+  if (soc > 100.0f) soc = 100.0f;
+  return soc;
+}
+
+// ===================== SoC (OCV-based, sama konsep dengan app) =====================
+
+// Koreksi tegangan ke OCV (open-circuit voltage) dengan resistansi pack.
+// Asumsi: arus positif = DISCHARGE (tegangan turun karena beban).
 static float pack_ocv_from_vi(float measuredPackVoltageV, float packCurrentA) {
-  // Discharge current positive -> V_ocv = V_meas + I * R
+  // V_ocv ≈ V_meas + I * R_pack
+  //  - Discharge  (I > 0): V_ocv = V_meas + I * R   (angkat tegangan ke atas)
+  //  - Charging   (I < 0): V_ocv = V_meas + I * R   (I negatif => mengurangi tegangan)
   return measuredPackVoltageV + packCurrentA * R_PACK_OHM();
 }
 
+// Mapping tegangan per-cell -> SoC% dengan 3 titik:
+//   PCELL_VMIN -> 0%
+//   PCELL_VNOM -> 50%
+//   PCELL_VMAX -> 100%
+static float soc_from_cell_ocv(float cellVoltageV) {
+  const float vmin = PCELL_VMIN;
+  const float vnom = PCELL_VNOM;
+  const float vmax = PCELL_VMAX;
+
+  float socPct = 0.0f;
+
+  if (cellVoltageV <= vmin) {
+    socPct = 0.0f;
+  } else if (cellVoltageV >= vmax) {
+    socPct = 100.0f;
+  } else if (cellVoltageV <= vnom) {
+    // 0–50% (vmin → vnom)
+    socPct = 50.0f * (cellVoltageV - vmin) / (vnom - vmin);
+  } else {
+    // 50–100% (vnom → vmax)
+    socPct = 50.0f + 50.0f * (cellVoltageV - vnom) / (vmax - vnom);
+  }
+
+  if (socPct < 0.0f)   socPct = 0.0f;
+  if (socPct > 100.0f) socPct = 100.0f;
+  return socPct;
+}
+
+// Estimasi SoC pack (OCV + Coulomb + EMA; tanpa absolute Ah kalibrasi penuh)
 float estimateSOCpct(float measuredPackVoltageV) {
+  // 1) Arus pack rata2 terakhir (untuk koreksi IR)
   float packCurrentA = averagedLast.valid ? averagedLast.currentA : 0.0f;
 
+  // 2) Koreksi ke OCV
   float packVoltageOCV = pack_ocv_from_vi(measuredPackVoltageV, packCurrentA);
   float cellVoltageV   = packVoltageOCV / SERIES_CELLS;
 
-  float socNow = soc_from_cell_ocv(cellVoltageV);
+  // 3) SoC dari OCV
+  float socOcv = soc_from_cell_ocv(cellVoltageV);
 
+  // 4) SoC dari Coulomb Counting (anchored ke SoC OCV)
+  float socCc  = soc_from_coulomb(socOcv);
+
+  // 5) Gabungkan, OCV lebih dominan
+  const float weightOcv = 0.85f;
+  const float weightCc  = 0.15f;
+  float socMix = weightOcv * socOcv + weightCc * socCc;
+
+  // 6) EMA smoothing
   static bool  emaInitialized = false;
   static float socEma = 0.0f;
   if (!emaInitialized) {
-    socEma = socNow;
+    socEma = socMix;
     emaInitialized = true;
+  } else {
+    socEma = SOC_EMA_ALPHA * socMix + (1.0f - SOC_EMA_ALPHA) * socEma;
   }
-  socEma = SOC_EMA_ALPHA * socNow + (1.0f - SOC_EMA_ALPHA) * socEma;
+
   if (socEma < 0.0f)   socEma = 0.0f;
   if (socEma > 100.0f) socEma = 100.0f;
   return socEma;
@@ -586,7 +670,6 @@ void drawBatteryBars(float percent) {
   display.print(percentText);
 }
 
-
 void drawCenteredBottom(const String& text) {
   int textWidth = text.length() * 6;
   int x = (SCREEN_WIDTH - textWidth) / 2;
@@ -617,7 +700,7 @@ void updateOLEDDisplay(const SensorReadings& readings) {
     display.print(headerOverlayText);
   }
 
-  // Battery bar with OCV-compensated SoC
+  // Battery bar with OCV + Coulomb SoC
   float socPercent = readings.valid ? estimateSOCpct(readings.voltageV) : 0.0f;
   drawBatteryBars(socPercent);
 
@@ -637,7 +720,7 @@ void updateOLEDDisplay(const SensorReadings& readings) {
 
   // Right: T / P
   display.setCursor(67, 25);
-  if (readings.valid) { 
+  if (readings.valid) {
     display.printf("T:%.2f ", readings.temperatureC);
     display.print((char)247);  // °
     display.print("C");
@@ -652,11 +735,6 @@ void updateOLEDDisplay(const SensorReadings& readings) {
   } else {
     display.print("P:--.--");
   }
-
-  // // Previous humidity line (kept as requested, but commented out)
-  // display.setCursor(68, 37);
-  // if (readings.valid) display.printf("H:%.1f %%RH", readings.humidityPercent);
-  // else               display.print("H:--.-");
 
   // Bottom centered status (animated)
   const int connectionCount = bleServer ? bleServer->getConnectedCount() : 0;
@@ -693,11 +771,11 @@ void updateOLEDDisplay(const SensorReadings& readings) {
 void print_wakeup_reason() {
   esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
   switch (wakeupReason) {
-    case ESP_SLEEP_WAKEUP_EXT0:   Serial.println("Wakeup: EXT0");   break;
-    case ESP_SLEEP_WAKEUP_EXT1:   Serial.println("Wakeup: EXT1");   break;
-    case ESP_SLEEP_WAKEUP_TIMER:  Serial.println("Wakeup: TIMER");  break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup: TOUCH"); break;
-    case ESP_SLEEP_WAKEUP_ULP:    Serial.println("Wakeup: ULP");    break;
+    case ESP_SLEEP_WAKEUP_EXT0:     Serial.println("Wakeup: EXT0");     break;
+    case ESP_SLEEP_WAKEUP_EXT1:     Serial.println("Wakeup: EXT1");     break;
+    case ESP_SLEEP_WAKEUP_TIMER:    Serial.println("Wakeup: TIMER");    break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup: TOUCH");    break;
+    case ESP_SLEEP_WAKEUP_ULP:      Serial.println("Wakeup: ULP");      break;
     case ESP_SLEEP_WAKEUP_GPIO: {
       uint64_t gpioMask = esp_sleep_get_gpio_wakeup_status();
       Serial.printf("Wakeup: GPIO (mask=0x%llX)\n", (unsigned long long)gpioMask);
