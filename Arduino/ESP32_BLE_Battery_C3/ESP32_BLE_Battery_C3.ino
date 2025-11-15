@@ -14,24 +14,24 @@
 #include <ArduinoOTA.h>
 
 // ===================== CONFIG =====================
-#define DEVICE_NUM              6          // 4 / 5 / 6 -> used in names
-#define WAKE_UP_BUTTON_PIN      2          // Button to GND; we use pull-up and wake on LOW
-#define USE_EXT0_WAKEUP         0          // Keep 0 (EXT1/GPIO wake) on C3
+#define DEVICE_NUM 5          // 4 / 5 / 6 -> used in names
+#define WAKE_UP_BUTTON_PIN 2  // Button to GND; we use pull-up and wake on LOW
+#define USE_EXT0_WAKEUP 0     // Keep 0 (EXT1/GPIO wake) on C3
 
-#define SLEEP_TIMEOUT_MS        60000      // 1 min idle -> sleep
-#define WAKE_INTERVAL_MS        300000     // timer wake every 5 minutes
-#define DOT_PERIOD_MS           500
-#define OLED_REFRESH_RATE       500        // ms (2 Hz)
+#define SLEEP_TIMEOUT_MS 60000   // 1 min idle -> sleep
+#define WAKE_INTERVAL_MS 300000  // timer wake every 5 minutes
+#define DOT_PERIOD_MS 500
+#define OLED_REFRESH_RATE 500  // ms (2 Hz)
 
 // BMS estimate for OLED bars (app does precise logic)
-#define SERIES_CELLS            4
-#define PARALLEL_CELLS          3
-#define PCELL_VMIN              2.70f
-#define PCELL_VNOM              3.60f
-#define PCELL_VMAX              4.20f
+#define SERIES_CELLS 4
+#define PARALLEL_CELLS 3
+#define PCELL_VMIN 2.70f
+#define PCELL_VNOM 3.60f
+#define PCELL_VMAX 4.20f
 
 // Kapasitas per sel (default 3400 mAh, sesuaikan dengan pack kamu)
-#define PCELL_CAPACITY_mAh      4000.0f
+#define PCELL_CAPACITY_mAh 4000.0f
 
 // Kapasitas pack total (Ah) = kapasitas per sel * parallel
 static float PACK_CAPACITY_Ah() {
@@ -39,34 +39,43 @@ static float PACK_CAPACITY_Ah() {
 }
 
 // ---- INA226 / SHUNT CONFIG ----
+bool DO_CAL = false;
 // shunt (Ohm). Lower shunt = higher measurement range, lower resolution.
-#define SHUNT_FOR_CAL           0.00621f
-
+#define SHUNT_FOR_CAL 0.00621f
+// #define SHUNT_FOR_CAL 0.0055f  // real shunt value: pararel 10 mΩ so it mustbe arround  ≈ 5 mΩ, But this use the test Calibrate use voltsRead = Volts Power SUpply & Multimeter, B \
+                               // Because i "GAK ada Multimeter presisi buat ohm", Ini dulu di cari, Baru Cari INA_LSB_mA, pake hitungan !!!!
 // current_LSB_mA recommendations: 0.050, 0.100, 0.250, 0.500, 1, 2, 2.5
-#define INA_LSB_mA_PRIMARY      0.625f
-#define INA_LSB_mA_FALLBACK     1.000f
+#define INA_LSB_mA_PRIMARY 0.625f  // Ini I_max(Targeted) nya 0.625 mA×32768≈ 20.48 A,
+// #define INA_LSB_mA_PRIMARY 0.625f   // Even if you “calibrate” it for 20 A or 30 A, ADC will clip at 16.38 A (Hardware Limit ?). Calc By :
+/* 16-Bit res = 65535 data ≈ –32768 to +32767 === I_max(Targeted) / 32768 
+                                              16.384 A / 32768 = 0.0004883 A ≈ 0.0005 A 
+                                              satuan mA jadi Current_LSB_A * 1000.0 = 0.0005 * 1000.0 = 0.5
+                                            */
+#define INA_LSB_mA_FALLBACK 1.000f  // Back-up LSB
 
 // current_zero_offset_mA (in driver). Keep 0; we do user offsets after read.
-#define INA_I_OFFSET_mA_CFG     0.0f
+#define INA_I_OFFSET_mA_CFG 0.0f
 
 // bus_V_scaling_e4 (default 10000 => volts)
-#define INA_V_SCALE_E4          10000
+#define INA_V_SCALE_E4 10000
 
 // ===== User calibration offsets (apply AFTER sensor read) =====
-#define V_OFFSET_mV             0.0f       // e.g. +25.0f adds +25 mV to pack voltage
-#define I_OFFSET_mA             0.0f       // e.g. -6.0f subtracts 6 mA
+// B4 = -99.5f | B5 = -79.5f 
+#define V_OFFSET_mV -79.5f  // e.g. +25.0f adds +25 mV to pack voltage 
+// B4 = -39.5f | B5 = -31.0f
+#define I_OFFSET_mA -31.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
 
 // ===== Load compensation + smoothing (SoC under load) =====
 // LiitoKala spec: internal resistance <17 mΩ / cell
-#define R_CELL_mOHM             18.0f      // per cell
-#define R_EXTRA_mOHM            60.0f      // BMS FETs + shunt + wiring (tune)
-#define SOC_EMA_ALPHA           0.30f      // 0..1; higher = snappier, lower = smoother
+#define R_CELL_mOHM 18.0f    // per cell
+#define R_EXTRA_mOHM 60.0f   // BMS FETs + shunt + wiring (tune)
+#define SOC_EMA_ALPHA 0.30f  // 0..1; higher = snappier, lower = smoother
 
 static float R_PACK_OHM() {
-  float groupResistance_mOhm     = R_CELL_mOHM / PARALLEL_CELLS;         // mΩ per parallel group
-  float seriesStack_mOhm         = groupResistance_mOhm * SERIES_CELLS;  // mΩ for 4S stack
-  float totalPackResistance_mOhm = seriesStack_mOhm + R_EXTRA_mOHM;      // mΩ incl. wiring/BMS
-  return totalPackResistance_mOhm / 1000.0f;                             // Ω
+  float groupResistance_mOhm = R_CELL_mOHM / PARALLEL_CELLS;         // mΩ per parallel group
+  float seriesStack_mOhm = groupResistance_mOhm * SERIES_CELLS;      // mΩ for 4S stack
+  float totalPackResistance_mOhm = seriesStack_mOhm + R_EXTRA_mOHM;  // mΩ incl. wiring/BMS
+  return totalPackResistance_mOhm / 1000.0f;                         // Ω
 }
 
 // I2C pins (ESP32-C3)
@@ -74,9 +83,9 @@ static float R_PACK_OHM() {
 #define I2C_SCL_PIN 4
 
 // OTA AP credentials
-#define OTA_PASSWORD            "123456789"
-#define OTA_PORT                3232
-#define OTA_HOLD_MS             5000       // hold time to toggle OTA
+#define OTA_PASSWORD "123456789"
+#define OTA_PORT 3232
+#define OTA_HOLD_MS 5000  // hold time to toggle OTA
 
 // OLED
 #define SCREEN_WIDTH 128
@@ -90,87 +99,87 @@ INA226 ina226(0x40, &Wire);
 // === BLE UUIDs (match Flutter) ===
 static NimBLEUUID SERVICE_UUID("91bad492-b950-4226-aa2b-4ede9fa42f59");
 // IMPORTANT: restored original characteristic UUID (ab3f)
-static NimBLEUUID CHAR_UUID   ("cba1d466-344c-4be3-ab3f-189daa0a16d8");
+static NimBLEUUID CHAR_UUID("cba1d466-344c-4be3-ab3f-189daa0a16d8");
 
 // BLE globals
-NimBLEServer*         bleServer             = nullptr;
+NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* bleDataCharacteristic = nullptr;
-String                bleDeviceName;
-unsigned long         lastConnectionTimeMs  = 0;
-unsigned long         lastNotifyMillis      = 0;
-unsigned long         notifyIntervalMs      = 2000;   // Kirim Data tiap 2 detik
+String bleDeviceName;
+unsigned long lastConnectionTimeMs = 0;
+unsigned long lastNotifyMillis = 0;
+unsigned long notifyIntervalMs = 2000;  // Kirim Data tiap 2 detik
 
 // Adv / status animation
-uint8_t       dotPhase      = 0;
+uint8_t dotPhase = 0;
 unsigned long lastDotTickMs = 0;
 
 // OTA state
-bool      otaMode          = false;
-String    otaSSID;
-IPAddress otaIP(0,0,0,0);
+bool otaMode = false;
+String otaSSID;
+IPAddress otaIP(0, 0, 0, 0);
 
 // Button/hold detection (shared for enter/exit OTA)
-bool          holdInProgress     = false;
-unsigned long holdStartMs        = 0;
-int           overlayCountdown   = -1;     // -1 = no overlay
-String        headerOverlayText  = "";     // "ROM-(4)" ... "ROM-(1)"
+bool holdInProgress = false;
+unsigned long holdStartMs = 0;
+int overlayCountdown = -1;      // -1 = no overlay
+String headerOverlayText = "";  // "ROM-(4)" ... "ROM-(1)"
 
 // ======== Define SensorReadings BEFORE prototypes ========
 struct SensorReadings {
-  float temperatureC;      // °C
-  float currentA;          // A
-  float voltageV;          // V
-  float powerW;            // W
-  float humidityPercent;   // %RH (still measured, unused on OLED now)
-  bool  valid;
+  float temperatureC;     // °C
+  float currentA;         // A
+  float voltageV;         // V
+  float powerW;           // W
+  float humidityPercent;  // %RH (still measured, unused on OLED now)
+  bool valid;
 };
 
 // ===== Averaging state =====
 struct AccumulatedSums {
-  double sumVoltageV      = 0;
-  double sumCurrentA      = 0;
-  double sumTemperatureC  = 0;
-  double sumPowerW        = 0;
-  double sumHumidityPct   = 0;
-  int    sampleCount      = 0;
+  double sumVoltageV = 0;
+  double sumCurrentA = 0;
+  double sumTemperatureC = 0;
+  double sumPowerW = 0;
+  double sumHumidityPct = 0;
+  int sampleCount = 0;
 } acc1s;
 
-SensorReadings averagedLast   = {0,0,0,0,0,false};
-SensorReadings averagedPrev   = {0,0,0,0,0,false};
-bool           have1sWindow   = false;
-bool           have2sWindow   = false;
-unsigned long  lastOLEDms     = 0;
+SensorReadings averagedLast = { 0, 0, 0, 0, 0, false };
+SensorReadings averagedPrev = { 0, 0, 0, 0, 0, false };
+bool have1sWindow = false;
+bool have2sWindow = false;
+unsigned long lastOLEDms = 0;
 
 // ===== Coulomb Counting state (integrasi arus) =====
-double        coulombAccumulatedAh = 0.0;   // Ah netto sejak anchor
-unsigned long lastCoulombMs        = 0;     // timestamp terakhir update CC
-bool          coulombInitialized   = false; // sudah pernah di-anchor?
-float         coulombBaseSocPct    = 50.0f; // SoC anchor dari OCV pertama kali
+double coulombAccumulatedAh = 0.0;  // Ah netto sejak anchor
+unsigned long lastCoulombMs = 0;    // timestamp terakhir update CC
+bool coulombInitialized = false;    // sudah pernah di-anchor?
+float coulombBaseSocPct = 50.0f;    // SoC anchor dari OCV pertama kali
 
 // ======== Prototypes ========
-bool            initializeHardware();
-void            initializeBLE();
-SensorReadings  getInstantReading();
-void            notifyAll(const SensorReadings& readings);
-void            updateOLEDDisplay(const SensorReadings& readings);
-void            drawBatteryBars(float percent);
+bool initializeHardware();
+void initializeBLE();
+SensorReadings getInstantReading();
+void notifyAll(const SensorReadings& readings);
+void updateOLEDDisplay(const SensorReadings& readings);
+void drawBatteryBars(float percent);
 // ---- SoC helpers ----
-float           estimateSOCpct(float measuredPackVoltageV);
-static float    pack_ocv_from_vi(float measuredPackVoltageV, float packCurrentA);
-static float    soc_from_cell_ocv(float cellVoltageV);
-void            updateCoulombCounting(const SensorReadings& readings);
-float           soc_from_coulomb(float socOcv);
+float estimateSOCpct(float measuredPackVoltageV);
+static float pack_ocv_from_vi(float measuredPackVoltageV, float packCurrentA);
+static float soc_from_cell_ocv(float cellVoltageV);
+void updateCoulombCounting(const SensorReadings& readings);
+float soc_from_coulomb(float socOcv);
 
-void            drawCenteredBottom(const String& text);
-void            print_wakeup_reason();
-void            enterDeepSleep();
-void            scanI2C();
+void drawCenteredBottom(const String& text);
+void print_wakeup_reason();
+void enterDeepSleep();
+void scanI2C();
 
-void            checkOTAToggle();
-void            startOTA_AP_Mode();
-void            stopOTA_AP_Mode();
-String          twoDigit(int n);
-bool            runSleepCountdownCancelable(int seconds);
+void checkOTAToggle();
+void startOTA_AP_Mode();
+void stopOTA_AP_Mode();
+String twoDigit(int n);
+bool runSleepCountdownCancelable(int seconds);
 
 // ================== BLE CALLBACKS ==================
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -203,7 +212,7 @@ void setup() {
   pinMode(WAKE_UP_BUTTON_PIN, INPUT_PULLUP);
 
   lastConnectionTimeMs = millis();
-  lastCoulombMs        = millis();   // inisialisasi timestamp CC
+  lastCoulombMs = millis();  // inisialisasi timestamp CC
 
   // Optionally allow entering OTA right after boot if held
   checkOTAToggle();
@@ -235,11 +244,14 @@ void loop() {
     }
 
     display.setCursor(0, 12);
-    display.print("SSID: "); display.print(otaSSID);
+    display.print("SSID: ");
+    display.print(otaSSID);
     display.setCursor(0, 24);
-    display.print("PWD : "); display.print(OTA_PASSWORD);
+    display.print("PWD : ");
+    display.print(OTA_PASSWORD);
     display.setCursor(0, 36);
-    display.print("IP  : "); display.print(otaIP == IPAddress(0,0,0,0) ? "192.168.4.1" : otaIP.toString());
+    display.print("IP  : ");
+    display.print(otaIP == IPAddress(0, 0, 0, 0) ? "192.168.4.1" : otaIP.toString());
     display.setCursor(0, 46);
     display.print("Update Via ArduinoIDE");
     display.setCursor(0, 56);
@@ -253,12 +265,12 @@ void loop() {
   // ---- 1) Take an instantaneous sample (corrected with offsets) ----
   SensorReadings instantReading = getInstantReading();
   if (instantReading.valid) {
-    acc1s.sumVoltageV     += instantReading.voltageV;
-    acc1s.sumCurrentA     += instantReading.currentA;
-    acc1s.sumPowerW       += instantReading.powerW;
+    acc1s.sumVoltageV += instantReading.voltageV;
+    acc1s.sumCurrentA += instantReading.currentA;
+    acc1s.sumPowerW += instantReading.powerW;
     acc1s.sumTemperatureC += instantReading.temperatureC;
-    acc1s.sumHumidityPct  += instantReading.humidityPercent;
-    acc1s.sampleCount     += 1;
+    acc1s.sumHumidityPct += instantReading.humidityPercent;
+    acc1s.sampleCount += 1;
   }
 
   // ---- 2) On each OLED_REFRESH_RATE boundary, finalize OLED average ----
@@ -269,14 +281,14 @@ void loop() {
     if (acc1s.sampleCount > 0) {
       averagedPrev = averagedLast;
 
-      averagedLast.temperatureC    = (float)(acc1s.sumTemperatureC / acc1s.sampleCount);
-      averagedLast.currentA        = (float)(acc1s.sumCurrentA     / acc1s.sampleCount);
-      averagedLast.powerW          = (float)(acc1s.sumPowerW       / acc1s.sampleCount);
-      averagedLast.voltageV        = (float)(acc1s.sumVoltageV     / acc1s.sampleCount);
-      averagedLast.humidityPercent = (float)(acc1s.sumHumidityPct  / acc1s.sampleCount);
-      averagedLast.valid           = true;
+      averagedLast.temperatureC = (float)(acc1s.sumTemperatureC / acc1s.sampleCount);
+      averagedLast.currentA = (float)(acc1s.sumCurrentA / acc1s.sampleCount);
+      averagedLast.powerW = (float)(acc1s.sumPowerW / acc1s.sampleCount);
+      averagedLast.voltageV = (float)(acc1s.sumVoltageV / acc1s.sampleCount);
+      averagedLast.humidityPercent = (float)(acc1s.sumHumidityPct / acc1s.sampleCount);
+      averagedLast.valid = true;
 
-      have2sWindow = have1sWindow;    // becomes true after second window
+      have2sWindow = have1sWindow;  // becomes true after second window
       have1sWindow = true;
 
       // ====== UPDATE COULOMB COUNTING (pakai rata-rata window) ======
@@ -300,12 +312,12 @@ void loop() {
       lastNotifyMillis = nowMs;
 
       SensorReadings bleAverage;
-      bleAverage.valid           = true;
-      bleAverage.voltageV        = (averagedLast.voltageV     + averagedPrev.voltageV)     * 0.5f;
-      bleAverage.currentA        = (averagedLast.currentA     + averagedPrev.currentA)     * 0.5f;
-      bleAverage.temperatureC    = (averagedLast.temperatureC + averagedPrev.temperatureC) * 0.5f;
+      bleAverage.valid = true;
+      bleAverage.voltageV = (averagedLast.voltageV + averagedPrev.voltageV) * 0.5f;
+      bleAverage.currentA = (averagedLast.currentA + averagedPrev.currentA) * 0.5f;
+      bleAverage.temperatureC = (averagedLast.temperatureC + averagedPrev.temperatureC) * 0.5f;
       bleAverage.humidityPercent = (averagedLast.humidityPercent + averagedPrev.humidityPercent) * 0.5f;
-      bleAverage.powerW          = (averagedLast.powerW       + averagedPrev.powerW)       * 0.5f;
+      bleAverage.powerW = (averagedLast.powerW + averagedPrev.powerW) * 0.5f;
 
       notifyAll(bleAverage);
     }
@@ -386,7 +398,10 @@ bool initializeHardware() {
   uint8_t inaAddress = 0;
   for (uint8_t addr = 0x40; addr <= 0x45; addr++) {
     Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) { inaAddress = addr; break; }
+    if (Wire.endTransmission() == 0) {
+      inaAddress = addr;
+      break;
+    }
   }
   if (inaAddress == 0) {
     Serial.println("INA226 not found on 0x40..0x45.");
@@ -406,26 +421,110 @@ bool initializeHardware() {
     SHUNT_FOR_CAL,
     INA_LSB_mA_PRIMARY,
     INA_I_OFFSET_mA_CFG,
-    INA_V_SCALE_E4
-  );
+    INA_V_SCALE_E4);
   if (rc != 0) {
+    Serial.println("\n***** Config Error! Chosen values outside range *****\n");
     Serial.printf("INA226.configure(0.625 mA) rc=%d, fallback 1.000 mA\n", rc);
     rc = ina226.configure(
       SHUNT_FOR_CAL,
       INA_LSB_mA_FALLBACK,
       INA_I_OFFSET_mA_CFG,
-      INA_V_SCALE_E4
-    );
+      INA_V_SCALE_E4);
     if (rc != 0) {
       Serial.printf("INA226.configure(1.000 mA) rc=%d\n", rc);
       return false;
     }
-  }
+  } else {
+    if (DO_CAL) {
+      Serial.println("\n***** INA 226 CONFIGURE *****");
+      Serial.print("Shunt:\t");
+      Serial.print(SHUNT_FOR_CAL, 4);
+      Serial.println(" Ohm");
+      Serial.print("current_LSB_mA:\t");
+      Serial.print(INA_LSB_mA_PRIMARY * 1e+3, 1);
+      Serial.println(" uA / bit");
+      Serial.print("\nMax Measurable Current:\t");
+      Serial.print(ina226.getMaxCurrent(), 3);
+      Serial.println(" A");
 
-  ina226.setAverage(INA226_64_SAMPLES);
+
+
+      /* CALIBRATION */
+
+      float bv = 0, cu = 0;
+      for (int i = 0; i < 10; i++) {
+        bv += ina226.getBusVoltage();
+        cu += ina226.getCurrent_mA();
+        delay(150);
+      }
+      bv /= 10;
+      cu /= 10;
+      Serial.println("\nAverage Bus and Current values for use in Shunt Resistance, Bus Voltage and Current Zero Offset calibration:");
+      bv = 0;
+      for (int i = 0; i < 10; i++) {
+        bv += ina226.getBusVoltage();
+        delay(100);
+      }
+      bv /= 10;
+      Serial.print("\nAverage of 10 Bus Voltage values = ");
+      Serial.print(bv, 3);
+      Serial.println("V");
+      cu = 0;
+      for (int i = 0; i < 10; i++) {
+        cu += ina226.getCurrent_mA();
+        delay(100);
+      }
+      cu /= 10;
+      Serial.print("Average of 10 Current values = ");
+      Serial.print(cu, 3);
+      Serial.println("mA");
+
+      Serial.println("\nCALIBRATION VALUES TO USE:\t(DMM = Digital MultiMeter)");
+      Serial.println("Step 5. Attach a power supply with voltage 5-10V to INA226 on VBUS/IN+ and GND pins, without any load.");
+      Serial.print("\tcurrent_zero_offset_mA = ");
+      Serial.print(INA_I_OFFSET_mA_CFG + cu, 3);
+      Serial.println("mA");
+      if (cu > 5)
+        Serial.println("********** NOTE: No resistive load needs to be present during current_zero_offset_mA calibration. **********");
+      Serial.print("\tbus_V_scaling_e4 = ");
+      Serial.print(INA_V_SCALE_E4);
+      Serial.print(" / ");
+      Serial.print(bv, 3);
+      Serial.println(" * (DMM Measured Bus Voltage)");
+      Serial.println("Step 8. Set DMM in current measurement mode. Use a resistor that will generate around 50-100mA IOUT measurement between IN- and GND pins with DMM in series with load. Note current measured on DMM.");
+      Serial.print("\tshunt = ");
+      Serial.print(SHUNT_FOR_CAL);
+      Serial.print(" * ");
+      Serial.print(cu, 3);
+      Serial.println(" / (DMM Measured IOUT)");
+      if (cu < 40)
+        Serial.println("********** NOTE: IOUT needs to be more than 50mA for better shunt resistance calibration. **********");
+      delay(1000);
+
+      /* MEASUREMENTS */
+
+      Serial.println("\nBUS(V) SHUNT(mV) CURRENT(mA) POWER(mW)");
+      for (int i = 0; i < 5; i++) {
+        bv = ina226.getBusVoltage();
+        float sv = ina226.getShuntVoltage_mV();
+        cu = ina226.getCurrent_mA();
+        float po = (bv - sv / 1000) * cu;
+        Serial.print(bv, 3);
+        Serial.print("\t");
+        Serial.print(sv, 3);
+        Serial.print("\t\t");
+        Serial.print(cu, 1);
+        Serial.print("\t");
+        Serial.print(po, 1);
+        Serial.println();
+        delay(1000);
+      }
+    }
+  }
+  ina226.setAverage(INA226_128_SAMPLES);
   ina226.setBusVoltageConversionTime(INA226_2100_us);
   ina226.setShuntVoltageConversionTime(INA226_2100_us);
-  ina226.setMode(7); // continuous shunt+bus
+  ina226.setMode(7);  // continuous shunt+bus
 
   // BLE name (also used in header)
   bleDeviceName = String("BATT-Mon_") + String(DEVICE_NUM);
@@ -436,8 +535,8 @@ bool initializeHardware() {
 
 void initializeBLE() {
   NimBLEDevice::init(bleDeviceName.c_str());
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // optional
-  NimBLEDevice::setMTU(256);                // optional
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // optional
+  NimBLEDevice::setMTU(256);               // optional
 
   bleServer = NimBLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
@@ -445,18 +544,17 @@ void initializeBLE() {
   NimBLEService* bleService = bleServer->createService(SERVICE_UUID);
 
   bleDataCharacteristic = bleService->createCharacteristic(
-      CHAR_UUID,
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
-  );
+    CHAR_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
   // Portable CCCD (0x2902)
   NimBLEDescriptor* cccd = new NimBLEDescriptor(
-      (uint16_t)0x2902,
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
-      2 // 2-byte CCCD
+    (uint16_t)0x2902,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
+    2  // 2-byte CCCD
   );
   // Default notifications ON (0x0001, little-endian)
-  uint8_t cccdInitialValue[2] = {0x01, 0x00};
+  uint8_t cccdInitialValue[2] = { 0x01, 0x00 };
   cccd->setValue(cccdInitialValue, sizeof(cccdInitialValue));
   bleDataCharacteristic->addDescriptor(cccd);
 
@@ -485,20 +583,20 @@ SensorReadings getInstantReading() {
 
   sensors_event_t humidityEvent, temperatureEvent;
   if (aht.getEvent(&humidityEvent, &temperatureEvent)) {
-    float busVoltageV          = ina226.getBusVoltage(); // V
-    float shuntCurrent_mA      = ina226.getCurrent_mA(); // mA
-    float busPower_mW          = ina226.getPower_mW();   // mW
+    float busVoltageV = ina226.getBusVoltage();      // V
+    float shuntCurrent_mA = ina226.getCurrent_mA();  // mA
+    float busPower_mW = ina226.getPower_mW();        // mW
 
     // Apply user offsets (post-read)
-    busVoltageV      += (V_OFFSET_mV / 1000.0f);
-    shuntCurrent_mA  += I_OFFSET_mA;
+    busVoltageV += (V_OFFSET_mV / 1000.0f);
+    shuntCurrent_mA += I_OFFSET_mA;
 
-    readings.temperatureC    = temperatureEvent.temperature;
+    readings.temperatureC = temperatureEvent.temperature;
     readings.humidityPercent = humidityEvent.relative_humidity;
-    readings.voltageV        = busVoltageV;
-    readings.currentA        = shuntCurrent_mA / 1000.0f; // A
-    readings.powerW          = busPower_mW / 1000.0f;     // W
-    readings.valid           = true;
+    readings.voltageV = busVoltageV;
+    readings.currentA = shuntCurrent_mA / 1000.0f;  // A
+    readings.powerW = busPower_mW / 1000.0f;        // W
+    readings.valid = true;
   }
   return readings;
 }
@@ -552,15 +650,15 @@ float soc_from_coulomb(float socOcv) {
 
   if (!coulombInitialized) {
     // Pertama kali dipanggil: anchor coulomb ke SoC OCV saat itu
-    coulombBaseSocPct    = socOcv;
+    coulombBaseSocPct = socOcv;
     coulombAccumulatedAh = 0.0;
-    coulombInitialized   = true;
+    coulombInitialized = true;
   }
 
   float deltaSocPct = (float)(coulombAccumulatedAh / capAh) * 100.0f;
   float soc = coulombBaseSocPct + deltaSocPct;
 
-  if (soc < 0.0f)   soc = 0.0f;
+  if (soc < 0.0f) soc = 0.0f;
   if (soc > 100.0f) soc = 100.0f;
   return soc;
 }
@@ -599,7 +697,7 @@ static float soc_from_cell_ocv(float cellVoltageV) {
     socPct = 50.0f + 50.0f * (cellVoltageV - vnom) / (vmax - vnom);
   }
 
-  if (socPct < 0.0f)   socPct = 0.0f;
+  if (socPct < 0.0f) socPct = 0.0f;
   if (socPct > 100.0f) socPct = 100.0f;
   return socPct;
 }
@@ -611,21 +709,21 @@ float estimateSOCpct(float measuredPackVoltageV) {
 
   // 2) Koreksi ke OCV
   float packVoltageOCV = pack_ocv_from_vi(measuredPackVoltageV, packCurrentA);
-  float cellVoltageV   = packVoltageOCV / SERIES_CELLS;
+  float cellVoltageV = packVoltageOCV / SERIES_CELLS;
 
   // 3) SoC dari OCV
   float socOcv = soc_from_cell_ocv(cellVoltageV);
 
   // 4) SoC dari Coulomb Counting (anchored ke SoC OCV)
-  float socCc  = soc_from_coulomb(socOcv);
+  float socCc = soc_from_coulomb(socOcv);
 
   // 5) Gabungkan, OCV lebih dominan
   const float weightOcv = 0.85f;
-  const float weightCc  = 0.15f;
+  const float weightCc = 0.15f;
   float socMix = weightOcv * socOcv + weightCc * socCc;
 
   // 6) EMA smoothing
-  static bool  emaInitialized = false;
+  static bool emaInitialized = false;
   static float socEma = 0.0f;
   if (!emaInitialized) {
     socEma = socMix;
@@ -634,19 +732,19 @@ float estimateSOCpct(float measuredPackVoltageV) {
     socEma = SOC_EMA_ALPHA * socMix + (1.0f - SOC_EMA_ALPHA) * socEma;
   }
 
-  if (socEma < 0.0f)   socEma = 0.0f;
+  if (socEma < 0.0f) socEma = 0.0f;
   if (socEma > 100.0f) socEma = 100.0f;
   return socEma;
 }
 
 // === Single long battery bar with % text ===
 void drawBatteryBars(float percent) {
-  if (percent < 0.0f)  percent = 0.0f;
+  if (percent < 0.0f) percent = 0.0f;
   if (percent > 100.0f) percent = 100.0f;
 
-  const int barX      = 0;
-  const int barY      = 9;
-  const int barWidth  = 100;
+  const int barX = 0;
+  const int barY = 9;
+  const int barWidth = 100;
   const int barHeight = 8;
 
   display.drawRect(barX, barY, barWidth, barHeight, SSD1306_WHITE);
@@ -657,7 +755,7 @@ void drawBatteryBars(float percent) {
   }
 
   // use floor instead of rounding up
-  int percentInt = (int)(percent);   // 99.4 -> 99, not 100
+  int percentInt = (int)(percent);  // 99.4 -> 99, not 100
   char percentText[8];
   snprintf(percentText, sizeof(percentText), "%d%%", percentInt);
 
@@ -712,11 +810,11 @@ void updateOLEDDisplay(const SensorReadings& readings) {
   // Left: V / A (averaged values)
   display.setCursor(0, 25);
   if (readings.valid) display.printf("V:%.2f V", readings.voltageV);
-  else                display.print("V:--.--");
+  else display.print("V:--.--");
 
   display.setCursor(0, 37);
   if (readings.valid) display.printf("A:%.2f A", readings.currentA);
-  else                display.print("A:--.--");
+  else display.print("A:--.--");
 
   // Right: T / P
   display.setCursor(67, 25);
@@ -730,7 +828,8 @@ void updateOLEDDisplay(const SensorReadings& readings) {
 
   display.setCursor(68, 37);
   if (readings.valid) {
-    float powerWatt = readings.powerW;
+    // float powerWatt = readings.powerW;
+    float powerWatt = readings.voltageV * readings.currentA;
     display.printf("P:%.2f W", powerWatt);
   } else {
     display.print("P:--.--");
@@ -742,7 +841,7 @@ void updateOLEDDisplay(const SensorReadings& readings) {
   if (connectionCount > 0) {
     String leftDots, rightDots;
     for (uint8_t phaseIndex = 0; phaseIndex < dotPhase; ++phaseIndex) {
-      leftDots  += ". ";
+      leftDots += ". ";
       rightDots += " .";
     }
     statusText = leftDots + String("Connected (") + String(connectionCount) + String(")") + rightDots;
@@ -754,7 +853,7 @@ void updateOLEDDisplay(const SensorReadings& readings) {
     }
     String leftDots, rightDots;
     for (uint8_t phaseIndex = 0; phaseIndex < dotPhase; ++phaseIndex) {
-      leftDots  += ". ";
+      leftDots += ". ";
       rightDots += " .";
     }
     statusText = leftDots + "Adv" + rightDots;
@@ -771,16 +870,17 @@ void updateOLEDDisplay(const SensorReadings& readings) {
 void print_wakeup_reason() {
   esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
   switch (wakeupReason) {
-    case ESP_SLEEP_WAKEUP_EXT0:     Serial.println("Wakeup: EXT0");     break;
-    case ESP_SLEEP_WAKEUP_EXT1:     Serial.println("Wakeup: EXT1");     break;
-    case ESP_SLEEP_WAKEUP_TIMER:    Serial.println("Wakeup: TIMER");    break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup: TOUCH");    break;
-    case ESP_SLEEP_WAKEUP_ULP:      Serial.println("Wakeup: ULP");      break;
-    case ESP_SLEEP_WAKEUP_GPIO: {
-      uint64_t gpioMask = esp_sleep_get_gpio_wakeup_status();
-      Serial.printf("Wakeup: GPIO (mask=0x%llX)\n", (unsigned long long)gpioMask);
-      break;
-    }
+    case ESP_SLEEP_WAKEUP_EXT0: Serial.println("Wakeup: EXT0"); break;
+    case ESP_SLEEP_WAKEUP_EXT1: Serial.println("Wakeup: EXT1"); break;
+    case ESP_SLEEP_WAKEUP_TIMER: Serial.println("Wakeup: TIMER"); break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup: TOUCH"); break;
+    case ESP_SLEEP_WAKEUP_ULP: Serial.println("Wakeup: ULP"); break;
+    case ESP_SLEEP_WAKEUP_GPIO:
+      {
+        uint64_t gpioMask = esp_sleep_get_gpio_wakeup_status();
+        Serial.printf("Wakeup: GPIO (mask=0x%llX)\n", (unsigned long long)gpioMask);
+        break;
+      }
     default:
       Serial.printf("Wakeup not from deep sleep: %d\n", wakeupReason);
       break;
@@ -805,14 +905,17 @@ bool runSleepCountdownCancelable(int seconds) {
 
     // poll for up to 1000 ms with debounce and OTA suppression
     unsigned long deadlineMs = millis() + 1000;
-    bool          debouncedLow = false;
-    unsigned long lowSinceMs   = 0;
+    bool debouncedLow = false;
+    unsigned long lowSinceMs = 0;
 
     while ((long)(deadlineMs - millis()) > 0) {
       // If user presses the wake button (active-LOW), cancel
       int pinState = digitalRead(WAKE_UP_BUTTON_PIN);
       if (pinState == LOW) {
-        if (!debouncedLow) { debouncedLow = true; lowSinceMs = millis(); }
+        if (!debouncedLow) {
+          debouncedLow = true;
+          lowSinceMs = millis();
+        }
         // simple 30 ms debounce
         if (millis() - lowSinceMs >= 30) {
           // Cancel the countdown
@@ -829,7 +932,7 @@ bool runSleepCountdownCancelable(int seconds) {
       delay(20);
     }
   }
-  return false; // countdown reached 0
+  return false;  // countdown reached 0
 }
 
 void enterDeepSleep() {
@@ -881,8 +984,12 @@ void startOTA_AP_Mode() {
   ArduinoOTA.setHostname(otaSSID.c_str());
   ArduinoOTA.setPassword(OTA_PASSWORD);
 
-  ArduinoOTA.onStart([]() { Serial.println("OTA Start"); });
-  ArduinoOTA.onEnd([]()   { Serial.println("\nOTA End"); });
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA End");
+  });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     static uint8_t lastPercent = 255;
     uint8_t percent = (progress * 100) / total;
@@ -906,44 +1013,44 @@ void stopOTA_AP_Mode() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
   otaMode = false;
-  otaIP = IPAddress(0,0,0,0);
+  otaIP = IPAddress(0, 0, 0, 0);
   Serial.println("OTA AP stopped");
 }
 
 void checkOTAToggle() {
   // Button is active-LOW (to GND). Show overlay "ROM-(4..1)" for last 4s of hold.
-  int           pinState = digitalRead(WAKE_UP_BUTTON_PIN);
-  unsigned long nowMs    = millis();
+  int pinState = digitalRead(WAKE_UP_BUTTON_PIN);
+  unsigned long nowMs = millis();
 
   if (pinState == LOW) {
     if (!holdInProgress) {
-      holdInProgress   = true;
-      holdStartMs      = nowMs;
-      overlayCountdown = 4;   // start at 4
+      holdInProgress = true;
+      holdStartMs = nowMs;
+      overlayCountdown = 4;  // start at 4
     } else {
-      unsigned long heldMs  = nowMs - holdStartMs;
-      long          remainMs = (long)OTA_HOLD_MS - (long)heldMs;
-      int showSeconds = (remainMs > 0) ? ((remainMs + 999) / 1000) : 0; // ceil
-      if (showSeconds > 4) showSeconds = 4;   // clamp to 4..1
+      unsigned long heldMs = nowMs - holdStartMs;
+      long remainMs = (long)OTA_HOLD_MS - (long)heldMs;
+      int showSeconds = (remainMs > 0) ? ((remainMs + 999) / 1000) : 0;  // ceil
+      if (showSeconds > 4) showSeconds = 4;                              // clamp to 4..1
       if (showSeconds < 0) showSeconds = 0;
       overlayCountdown = showSeconds;
 
       if (heldMs >= OTA_HOLD_MS) {
         // Toggle OTA mode
         if (otaMode) stopOTA_AP_Mode();
-        else         startOTA_AP_Mode();
+        else startOTA_AP_Mode();
 
         // prevent rapid retrigger; wait for release
         while (digitalRead(WAKE_UP_BUTTON_PIN) == LOW) {
           delay(10);
         }
-        holdInProgress   = false;
+        holdInProgress = false;
         overlayCountdown = -1;
       }
     }
   } else {
     // Released
-    holdInProgress   = false;
+    holdInProgress = false;
     overlayCountdown = -1;
   }
 }
