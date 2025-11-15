@@ -201,7 +201,7 @@ class DeviceState {
   final DiscoveredDevice device;
   StreamSubscription<ConnectionStateUpdate>? connSub;
   StreamSubscription<List<int>>? notifySub;
-  final TimeSeries history = TimeSeries(window: const Duration(minutes: 15));
+  final TimeSeries history = TimeSeries(window: const Duration(hours: 1));
   ParsedReading? last;
   bool connected = false;
   String? error;
@@ -221,6 +221,10 @@ class DeviceState {
   // Coulomb counting state
   double _accumulatedAh = 0.0;
   DateTime? _lastCCUpdate;
+
+  // Anchor Coulomb seperti firmware (first OCV)
+  bool _ccInitialized = false;
+  double _ccBaseSocPct = 50.0;
 
   // RAW capture
   String? lastRaw;
@@ -416,12 +420,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         if (!_devices.containsKey(d.id)) {
           final ds = DeviceState(d);
           ds.tabCtl.attach(this);
-          ds.userWantsConnection = true; // auto-connect for first discovery
+          ds.userWantsConnection = true; // auto-connect first discovery
           _devices[d.id] = ds;
           setState(() {});
           _connectAndSubscribe(ds);
         } else {
-          // Device exists, attempt reconnect only if user still wants connection
           final ds = _devices[d.id]!;
           if (!ds.connected && ds.userWantsConnection) {
             _connectAndSubscribe(ds);
@@ -450,7 +453,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Future<void> _connectAndSubscribe(DeviceState ds) async {
-    // honor user preference: don't connect if user explicitly disconnected
     if (!ds.userWantsConnection) return;
     if (ds.connected) return;
 
@@ -575,8 +577,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         _updateCoulombCounting(ds, reading);
 
         final isCharging = reading.ampx > 0.0;
+
+        // ============================================================
+        // FIX 1: Correct SOC calculation with proper resistance
+        // ============================================================
         final socOCV = _socPercentOCV(reading);
-        final socCC = _socPercentCC(ds);
+
+        // Coulomb anchored to OCV (firmware-like)
+        final socCC = _socPercentCC(ds, socOCV);
 
         // Combine OCV and CC with weighted average (OCV dominates for stability)
         final socCombinedRaw = (socOCV * 0.85 + socCC * 0.15).clamp(0.0, 100.0);
@@ -588,7 +596,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         );
         ds._lastSocTs = reading.ts;
 
-        // Use EMA-smoothed SoC in history for slope/ETA → much more stable
+        // Use EMA-smoothed SoC in history for slope/ETA
         ds.socHist.add(MapEntry(reading.ts, ds._socPctEma));
         final cutoff = DateTime.now().subtract(const Duration(minutes: 15));
         while (ds.socHist.isNotEmpty && ds.socHist.first.key.isBefore(cutoff)) {
@@ -627,25 +635,52 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     ds._lastCCUpdate = reading.ts;
   }
 
-  double _socPercentCC(DeviceState ds) {
+  double _socPercentCC(DeviceState ds, double socOcvNow) {
     final capAh = (_cellMah / 1000.0) * _parallelCells;
-    if (capAh <= 0) return 50.0;
+    if (capAh <= 0) return socOcvNow.clamp(0.0, 100.0);
+
+    if (!ds._ccInitialized) {
+      ds._ccInitialized = true;
+      ds._ccBaseSocPct = socOcvNow.clamp(0.0, 100.0);
+      ds._accumulatedAh = 0.0;
+      return ds._ccBaseSocPct;
+    }
 
     final socDelta = (ds._accumulatedAh / capAh) * 100.0;
-    return (50.0 + socDelta).clamp(0.0, 100.0);
+    return (ds._ccBaseSocPct + socDelta).clamp(0.0, 100.0);
   }
 
+  // ============================================================
+  // FIX 1: Correct SOC calculation with proper resistance
+  // ============================================================
   double _socPercentOCV(ParsedReading r) {
-    final rPerCellOhm = (_rCellMilliOhm.clamp(0, 1000)) / 1000.0;
-    final rSeries = rPerCellOhm * _seriesCells;
+    // Calculate pack resistance matching Arduino logic
+    final rPerCellMilliOhm = _rCellMilliOhm.clamp(0, 1000);
 
+    // Step 1: Parallel group resistance (cells in parallel)
+    final safeParallel = _parallelCells <= 0 ? 1 : _parallelCells;
+    final rGroupMilliOhm = rPerCellMilliOhm / safeParallel;
+
+    // Step 2: Series stack resistance (groups in series)
+    final rSeriesMilliOhm = rGroupMilliOhm * _seriesCells;
+
+    // Step 3: Add extra resistance (BMS FETs, wiring, etc.)
+    const rExtraMilliOhm = 60.0; // Same as Arduino R_EXTRA_mOHM
+    final rPackTotalMilliOhm = rSeriesMilliOhm + rExtraMilliOhm;
+
+    // Convert to Ohms
+    final rPackOhm = rPackTotalMilliOhm / 1000.0;
+
+    // IR compensation: positive current = charging
     final isCharging = r.ampx > 0.0;
     final vRestPack = isCharging
-        ? (r.voltx - r.ampx * rSeries)
-        : (r.voltx + r.ampx.abs() * rSeries);
+        ? (r.voltx - r.ampx * rPackOhm) // Charging: subtract voltage drop
+        : (r.voltx + r.ampx.abs() * rPackOhm); // Discharging: add voltage drop
 
+    // Per-cell voltage
     final vCell = (vRestPack / _seriesCells).clamp(0.0, 1000.0);
 
+    // Map to SOC percentage (3-point curve)
     final vmin = _vMin;
     final vnom = _vNom;
     final vmax = _vMax;
@@ -665,23 +700,22 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   Estimate? _computeEstimate(DeviceState ds) {
     final hist = ds.socHist;
-    if (hist.length < 10) {
-      // not enough data, keep previous estimate (avoids flicker)
+    if (hist.length < 5) {
       return ds.estimate;
     }
 
-    // Use up to last ~5 minutes of smoothed SoC history
+    // Ambil ~5 menit terakhir
     final newestTime = hist.last.key;
     final oldestAllowed = newestTime.subtract(const Duration(minutes: 5));
     final recent = hist.where((e) => !e.key.isBefore(oldestAllowed)).toList();
 
-    if (recent.length < 6) {
+    if (recent.length < 3) {
       return ds.estimate;
     }
 
     final t0 = recent.first.key;
-    final xs = <double>[];
-    final ys = <double>[];
+    final xs = <double>[]; // detik sejak t0
+    final ys = <double>[]; // SoC %
 
     for (final e in recent) {
       final dtSec = e.key.difference(t0).inMilliseconds / 1000.0;
@@ -691,12 +725,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
     final n = xs.length;
     final totalSpanSec = xs.last;
-    if (totalSpanSec < 60) {
-      // less than 1 minute span → too noisy, keep old estimate
+    if (totalSpanSec < 30) {
+      // kurang dari 30 detik history -> skip dulu
       return ds.estimate;
     }
 
-    // Linear regression slope (least squares) for SoC vs time
+    // Linear regression
     final meanX = xs.reduce((a, b) => a + b) / n;
     final meanY = ys.reduce((a, b) => a + b) / n;
 
@@ -707,76 +741,155 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       num += dx * (ys[i] - meanY);
       den += dx * dx;
     }
-    if (den == 0) return ds.estimate;
+    if (den == 0) {
+      return ds.estimate;
+    }
 
-    final slope = num / den; // % per second
-    final sN = ys.last;
+    final slope = num / den; // % per detik
+    final sN = ys.last; // SoC % terakhir (smoothed)
     final tN = t0.add(Duration(milliseconds: (xs.last * 1000).round()));
 
     final I = (ds.last?.ampx ?? 0.0);
+    final absI = I.abs();
     final isChargingBySign = I > 0.0;
 
-    Duration? toEmpty;
-    Duration? toFull;
-
     final capAh = (_cellMah / 1000.0) * _parallelCells;
-    final absI = I.abs();
 
-    const double minSlope = 2e-6; // very small slope threshold
-    const double minCurrA = 0.02;
+    // Threshold
+    const double minSlope = 5e-7; // dipakai kalau harusnya pakai slope
+    const double minCurrA =
+        0.005; // 5 mA, di bawah ini arus dianggap terlalu kecil
+    const double currPriorityThresh =
+        0.01; // >= 10 mA → pakai arus sebagai sumber utama
 
+    Duration? etaSlope;
+    Duration? etaCurrent;
+
+    // --- ETA berbasis slope SoC (opsional) ---
     if (isChargingBySign) {
       if (slope > minSlope) {
         final secondsToFull =
-            ((100.0 - sN) / slope).clamp(0, 365 * 24 * 3600).toDouble();
-        toFull = Duration(seconds: secondsToFull.round());
-      } else if (absI > minCurrA && capAh > 0) {
-        final pctPerSec = (absI / (capAh * 3600.0)) * 100.0;
-        final secondsToFull = ((100.0 - sN) / max(pctPerSec, 1e-9))
-            .clamp(0, 365 * 24 * 3600)
-            .toDouble();
-        toFull = Duration(seconds: secondsToFull.round());
+            ((100.0 - sN) / slope).clamp(0, 365.0 * 24 * 3600).toDouble();
+        etaSlope = Duration(seconds: secondsToFull.round());
       }
     } else {
       if (slope < -minSlope) {
         final secondsToEmpty =
-            (sN / (-slope)).clamp(0, 365 * 24 * 3600).toDouble();
-        toEmpty = Duration(seconds: secondsToEmpty.round());
-      } else if (absI > minCurrA && capAh > 0) {
-        final pctPerSec = (absI / (capAh * 3600.0)) * 100.0;
-        final secondsToEmpty =
-            (sN / max(pctPerSec, 1e-9)).clamp(0, 365 * 24 * 3600).toDouble();
-        toEmpty = Duration(seconds: secondsToEmpty.round());
+            (sN / (-slope)).clamp(0, 365.0 * 24 * 3600).toDouble();
+        etaSlope = Duration(seconds: secondsToEmpty.round());
       }
     }
 
-    // If estimate is insane (e.g. > 200 hours), keep old one instead
-    bool isReasonable(Duration? d) =>
-        d == null ? false : d.inHours <= 200 && !d.isNegative;
+    // --- ETA berbasis arus & kapasitas pack ---
+    if (absI > minCurrA && capAh > 0) {
+      final pctPerSec = (absI / (capAh * 3600.0)) * 100.0; // %/detik ideal
+      if (pctPerSec > 0) {
+        if (isChargingBySign) {
+          final secondsToFull =
+              ((100.0 - sN) / pctPerSec).clamp(0, 365.0 * 24 * 3600).toDouble();
+          etaCurrent = Duration(seconds: secondsToFull.round());
+        } else {
+          final secondsToEmpty =
+              (sN / pctPerSec).clamp(0, 365.0 * 24 * 3600).toDouble();
+          etaCurrent = Duration(seconds: secondsToEmpty.round());
+        }
+      }
+    }
+
+    // Pilih ETA yang dipakai: arus > 10 mA → utamakan arus
+    Duration? toFull;
+    Duration? toEmpty;
+    Duration? chosenEta;
 
     if (isChargingBySign) {
-      if (toFull == null || !isReasonable(toFull)) {
+      if (absI >= currPriorityThresh && etaCurrent != null) {
+        toFull = etaCurrent;
+        chosenEta = etaCurrent;
+        // debug:
+        print(
+            'ETA: Charging via current → ${toFull.inHours}h ${toFull.inMinutes % 60}m');
+      } else if (etaSlope != null) {
+        toFull = etaSlope;
+        chosenEta = etaSlope;
+        print(
+            'ETA: Charging via slope → ${toFull.inHours}h ${toFull.inMinutes % 60}m');
+      } else if (etaCurrent != null) {
+        toFull = etaCurrent;
+        chosenEta = etaCurrent;
+      }
+    } else {
+      if (absI >= currPriorityThresh && etaCurrent != null) {
+        toEmpty = etaCurrent;
+        chosenEta = etaCurrent;
+        print(
+            'ETA: Discharging via current → ${toEmpty.inHours}h ${toEmpty.inMinutes % 60}m');
+      } else if (etaSlope != null) {
+        toEmpty = etaSlope;
+        chosenEta = etaSlope;
+        print(
+            'ETA: Discharging via slope → ${toEmpty.inHours}h ${toEmpty.inMinutes % 60}m');
+      } else if (etaCurrent != null) {
+        toEmpty = etaCurrent;
+        chosenEta = etaCurrent;
+      }
+    }
+
+    // Sanity check (boleh kamu kecilkan/perbesar)
+    bool isReasonable(Duration? d) =>
+        d != null && !d.isNegative && d.inHours <= 500;
+
+    // if (isChargingBySign) {
+    //   if (!isReasonable(toFull)) {
+    //     print('ETA: Charging estimate unreasonable');
+    //     return ds.estimate;
+    //   }
+    // } else {
+    //   if (!isReasonable(toEmpty)) {
+    //     print('ETA: Discharge estimate unreasonable');
+    //     return ds.estimate;
+    //   }
+    // }
+
+    // Sanity check versi ringan: cuma buang yang null / negatif
+    if (isChargingBySign) {
+      if (toFull == null || toFull.isNegative) {
+        print('ETA: Charging estimate invalid');
         return ds.estimate;
       }
     } else {
-      if (toEmpty == null || !isReasonable(toEmpty)) {
+      if (toEmpty == null || toEmpty.isNegative) {
+        print('ETA: Discharge estimate invalid');
         return ds.estimate;
       }
     }
 
-    // Past and future series for chart
+    // --- Bangun data untuk chart ---
     final past = hist
         .map((e) => FlSpot(e.key.millisecondsSinceEpoch.toDouble(), e.value))
         .toList();
 
+    // Untuk garis masa depan, pakai slope yang konsisten dengan ETA terpilih
+    double slopeUse;
+    if (chosenEta != null && chosenEta.inSeconds > 0) {
+      final durSec = chosenEta.inSeconds.toDouble();
+      if (isChargingBySign) {
+        slopeUse = (100.0 - sN) / durSec;
+      } else {
+        slopeUse = -sN / durSec;
+      }
+    } else {
+      // fallback: pakai slope regresi apa adanya
+      slopeUse = slope;
+    }
+
     final now = tN;
     final List<FlSpot> future = [];
-    final slopeUse = slope;
 
-    final limitSec = 6 * 3600;
+    const int limitSec = 6 * 3600; // max 6 jam ke depan di chart
     final totalSec = isChargingBySign
         ? min(limitSec, (toFull?.inSeconds ?? 0))
         : min(limitSec, (toEmpty?.inSeconds ?? 0));
+
     if (totalSec > 0) {
       for (int s = 0; s <= totalSec; s += 10) {
         final soc = (sN + slopeUse * s).clamp(0.0, 100.0);
@@ -788,6 +901,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         );
       }
     }
+
+    // Debug ringkas
+    print(
+        'ETA Debug: I=${I.toStringAsFixed(3)}A, absI=${absI.toStringAsFixed(3)}A, '
+        'slope=${slope.toStringAsExponential(2)}, charging=$isChargingBySign, '
+        'etaCur=${etaCurrent?.inMinutes}, etaSlope=${etaSlope?.inMinutes}');
 
     return Estimate(
       charging: isChargingBySign,
@@ -801,7 +920,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   double _emaNext(double prev, double next, double alpha) {
-    // Bound next to [0, 100] as well
     double clamp01(double v) => v < 0 ? 0 : (v > 100 ? 100 : v);
     if (prev == 0) {
       return clamp01(next);
@@ -812,25 +930,19 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   Future<void> _toggleConnection(DeviceState ds) async {
     if (ds.connected) {
-      // User explicitly wants to disconnect and stay disconnected
       ds.userWantsConnection = false;
       ds.error = null;
 
-      // Stop notifications & connection stream
       await ds.notifySub?.cancel();
       await ds.connSub?.cancel();
 
-      // Mark as disconnected; the OS BLE link will be closed when
-      // the connection stream is cancelled.
       ds.connected = false;
       ds.lastDisconnectTime = DateTime.now();
 
       setState(() {});
     } else {
-      // User wants to connect (or reconnect)
       ds.userWantsConnection = true;
 
-      // Make sure no old connection stream is still alive
       await ds.connSub?.cancel();
       ds.connSub = null;
 
@@ -1227,10 +1339,8 @@ class _DeviceAccordion extends StatelessWidget {
     final isPortrait = media.orientation == Orientation.portrait;
     final aspectRatio = media.size.width / media.size.height;
 
-    // Adjust height based on aspect ratio
     final double contentHeightFactor;
     if (aspectRatio > 0.5) {
-      // Wider screens like 20:9, 21:9
       contentHeightFactor = 0.50;
     } else {
       contentHeightFactor = 0.65;
@@ -1250,7 +1360,7 @@ class _DeviceAccordion extends StatelessWidget {
 
     final estimateCard = _EstimateCard(state: state);
     final chartPane = KeyedSubtree(
-      key: ValueKey("chart-${state.device.id}-${state.history.items.length}"),
+      key: ValueKey("chart-${state.device.id}"),
       child: _ChartPane(state: state, controller: state.tabCtl.controller!),
     );
 
@@ -1601,13 +1711,35 @@ class _EstimateCard extends StatelessWidget {
     return "$dayPart${hrs.toString().padLeft(2, '0')}:${min.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}";
   }
 
+  String _bulanIndo(int m) {
+    const nama = [
+      "",
+      "Januari",
+      "Februari",
+      "Maret",
+      "April",
+      "Mei",
+      "Juni",
+      "Juli",
+      "Agustus",
+      "September",
+      "Oktober",
+      "November",
+      "Desember",
+    ];
+    if (m < 1 || m > 12) return m.toString();
+    return nama[m];
+  }
+
   String _fmtEta(DateTime now, Duration d) {
     final eta = now.add(d);
     final hh = eta.hour.toString().padLeft(2, '0');
     final mm = eta.minute.toString().padLeft(2, '0');
     final dd = eta.day.toString().padLeft(2, '0');
-    final mon = eta.month.toString().padLeft(2, '0');
-    return "$hh:$mm • $dd/$mon";
+    final monthName = _bulanIndo(eta.month);
+    final year = eta.year.toString();
+    // Hasil: "16:08, 16-November-2025"
+    return "$hh:$mm, $dd-$monthName-$year";
   }
 
   @override
@@ -1631,13 +1763,13 @@ class _EstimateCard extends StatelessWidget {
       icon = Icons.battery_charging_full;
       title = "Mengisi Baterai";
       bigTime = _fmtDur(est.toFull!);
-      sub = "ETA ${_fmtEta(est.calcTime, est.toFull!)}";
+      sub = "Penuh Pada-> ${_fmtEta(est.calcTime, est.toFull!)}";
       accent = Colors.green;
     } else if (!est.charging && est.toEmpty != null) {
       icon = Icons.timer;
       title = "Estimasi Baterai";
       bigTime = _fmtDur(est.toEmpty!);
-      sub = "Habis sekitar ${_fmtEta(est.calcTime, est.toEmpty!)}";
+      sub = "Habis Pada-> ${_fmtEta(est.calcTime, est.toEmpty!)}";
       accent = Colors.orange;
     } else {
       icon = Icons.insights_outlined;
@@ -1736,7 +1868,6 @@ class _ChartPaneState extends State<_ChartPane> {
         Expanded(
           child: TabBarView(
             controller: widget.controller,
-            // Disable swipe so horizontal gestures go to charts (not tab change)
             physics: const NeverScrollableScrollPhysics(),
             children: [
               _ValueChart(
@@ -1761,7 +1892,11 @@ class _ChartPaneState extends State<_ChartPane> {
   }
 }
 
-class _ValueChart extends StatelessWidget {
+// ============================================================
+// FIX 2 & 3: Scrollable Charts with Dynamic Y-axis
+// ============================================================
+
+class _ValueChart extends StatefulWidget {
   const _ValueChart({
     required this.title,
     required this.color,
@@ -1775,84 +1910,218 @@ class _ValueChart extends StatelessWidget {
   final DeviceState state;
 
   @override
+  State<_ValueChart> createState() => _ValueChartState();
+}
+
+class _ValueChartState extends State<_ValueChart> {
+  // Show 5 minutes of data at a time
+  // static const Duration _viewWindow = Duration(minutes: 5);
+  // Show 2 minutes of data at a time
+  static const Duration _viewWindow = Duration(minutes: 2);
+  double? _viewStartX; // null = show latest data
+
+  @override
   Widget build(BuildContext context) {
-    final items = state.history.items;
+    final items = widget.state.history.items;
 
     final data = items
-        .map((r) => FlSpot(r.ts.millisecondsSinceEpoch.toDouble(), selector(r)))
+        .map((r) =>
+            FlSpot(r.ts.millisecondsSinceEpoch.toDouble(), widget.selector(r)))
         .toList();
 
     if (data.isEmpty) {
       return const Center(child: Text("Tidak ada data"));
     }
 
-    final yVals = data.map((e) => e.y).toList();
-    final yMin = yVals.reduce(min);
-    final yMax = yVals.reduce(max);
-    final pad = (yMax - yMin).abs() * 0.1 + 0.1;
-
+    // Full data range
     final xMin = data.first.x;
     final xMax = data.last.x;
+    final totalDuration = xMax - xMin;
 
-    return Padding(
-      padding: const EdgeInsets.only(top: 6.0, right: 12, bottom: 8),
-      child: LineChart(
-        LineChartData(
-          minX: xMin,
-          maxX: xMax,
-          minY: yMin - pad,
-          maxY: yMax + pad,
-          gridData: const FlGridData(show: true),
-          titlesData: FlTitlesData(
-            leftTitles: const AxisTitles(
-              sideTitles: SideTitles(showTitles: true, reservedSize: 38),
-            ),
-            bottomTitles: AxisTitles(
-              sideTitles: SideTitles(
-                showTitles: true,
-                reservedSize: 26,
-                interval: const Duration(minutes: 3).inMilliseconds.toDouble(),
-                getTitlesWidget: (val, meta) {
-                  final dt = DateTime.fromMillisecondsSinceEpoch(val.toInt());
-                  final hh = dt.hour.toString().padLeft(2, '0');
-                  final mm = dt.minute.toString().padLeft(2, '0');
-                  return Text("$hh:$mm",
-                      style: Theme.of(context).textTheme.bodySmall);
-                },
+    // Visible window (2 minutes)
+    final viewWindowMs = _viewWindow.inMilliseconds.toDouble();
+
+    double visibleStartX;
+    double visibleEndX;
+
+    // If total data is less than view window, show all data
+    if (totalDuration <= viewWindowMs) {
+      visibleStartX = xMin;
+      visibleEndX = xMax;
+      // Untuk dataset pendek, kita anggap selalu "live"
+      _viewStartX = null;
+    } else if (_viewStartX == null) {
+      // Live mode -> selalu show window terakhir
+      visibleEndX = xMax;
+      visibleStartX = xMax - viewWindowMs;
+    } else {
+      // User sedang lihat history, jangan di-override
+      final maxStartX = xMax - viewWindowMs;
+      visibleStartX = _viewStartX!.clamp(xMin, maxStartX);
+      visibleEndX = visibleStartX + viewWindowMs;
+    }
+
+    // Filter data points in visible range
+    final visibleData = data
+        .where((spot) => spot.x >= visibleStartX && spot.x <= visibleEndX)
+        .toList();
+
+    if (visibleData.isEmpty) {
+      return const Center(child: Text("Tidak ada data dalam rentang ini"));
+    }
+
+    // Dynamic Y-axis: center around data with padding
+    final yVals = visibleData.map((e) => e.y).toList();
+    final yMin = yVals.reduce(min);
+    final yMax = yVals.reduce(max);
+    final yRange = (yMax - yMin).abs();
+
+    // 20% padding, min range 0.2
+    final padding = max(yRange * 0.20, 0.1);
+    final chartYMin = yMin - padding;
+    final chartYMax = yMax + padding;
+
+    final canScroll = totalDuration > viewWindowMs;
+    final isLive = _viewStartX == null || !canScroll;
+
+    return GestureDetector(
+      onHorizontalDragUpdate: canScroll
+          ? (details) {
+              setState(() {
+                // Convert pixels to milliseconds (approximate)
+                final pixelsPerMs =
+                    MediaQuery.of(context).size.width / viewWindowMs;
+                final deltaMs = -details.delta.dx / pixelsPerMs;
+                final maxStartX = xMax - viewWindowMs;
+
+                if (_viewStartX == null) {
+                  _viewStartX =
+                      (visibleStartX + deltaMs).clamp(xMin, maxStartX);
+                } else {
+                  _viewStartX = (_viewStartX! + deltaMs).clamp(xMin, maxStartX);
+                }
+              });
+            }
+          : null,
+      // Tidak ada auto-snap lagi
+      onHorizontalDragEnd: canScroll ? (_) {} : null,
+      child: Padding(
+        padding: const EdgeInsets.only(top: 6.0, right: 12, bottom: 8),
+        child: Stack(
+          children: [
+            LineChart(
+              LineChartData(
+                minX: visibleStartX,
+                maxX: visibleEndX,
+                minY: chartYMin,
+                maxY: chartYMax,
+                gridData: const FlGridData(show: true),
+                titlesData: FlTitlesData(
+                  leftTitles: const AxisTitles(
+                    sideTitles: SideTitles(showTitles: true, reservedSize: 44),
+                  ),
+                  bottomTitles: AxisTitles(
+                    sideTitles: SideTitles(
+                      showTitles: true,
+                      reservedSize: 26,
+                      interval:
+                          const Duration(minutes: 1).inMilliseconds.toDouble(),
+                      getTitlesWidget: (val, meta) {
+                        final dt =
+                            DateTime.fromMillisecondsSinceEpoch(val.toInt());
+                        final hh = dt.hour.toString().padLeft(2, '0');
+                        final mm = dt.minute.toString().padLeft(2, '0');
+                        return Text("$hh:$mm",
+                            style: Theme.of(context).textTheme.bodySmall);
+                      },
+                    ),
+                  ),
+                  rightTitles: const AxisTitles(
+                      sideTitles: SideTitles(showTitles: false)),
+                  topTitles: const AxisTitles(
+                      sideTitles: SideTitles(showTitles: false)),
+                ),
+                lineTouchData: LineTouchData(
+                  enabled: true,
+                  touchTooltipData: LineTouchTooltipData(
+                    getTooltipItems: (spots) {
+                      return spots.map((spot) {
+                        final dt =
+                            DateTime.fromMillisecondsSinceEpoch(spot.x.toInt());
+                        final hh = dt.hour.toString().padLeft(2, '0');
+                        final mm = dt.minute.toString().padLeft(2, '0');
+                        final ss = dt.second.toString().padLeft(2, '0');
+                        return LineTooltipItem(
+                          "$hh:$mm:$ss\n${spot.y.toStringAsFixed(2)}",
+                          const TextStyle(color: Colors.white),
+                        );
+                      }).toList();
+                    },
+                  ),
+                ),
+                borderData: FlBorderData(show: true),
+                lineBarsData: [
+                  LineChartBarData(
+                    isCurved: true,
+                    spots: data, // Pass all data, fl_chart handles clipping
+                    barWidth: 1.6,
+                    dotData: const FlDotData(show: false),
+                    color: widget.color,
+                  )
+                ],
               ),
             ),
-            rightTitles:
-                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles:
-                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          ),
-          lineTouchData: LineTouchData(
-            enabled: true,
-            touchTooltipData: LineTouchTooltipData(
-              getTooltipItems: (spots) {
-                return spots.map((spot) {
-                  final dt =
-                      DateTime.fromMillisecondsSinceEpoch(spot.x.toInt());
-                  final hh = dt.hour.toString().padLeft(2, '0');
-                  final mm = dt.minute.toString().padLeft(2, '0');
-                  final ss = dt.second.toString().padLeft(2, '0');
-                  return LineTooltipItem(
-                    "$hh:$mm:$ss\n${spot.y.toStringAsFixed(2)}",
-                    const TextStyle(color: Colors.white),
-                  );
-                }).toList();
-              },
+
+            // Scroll indicator overlay
+            if (totalDuration > viewWindowMs)
+              Positioned(
+                bottom: 0,
+                left: 0,
+                right: 0,
+                child: Container(
+                  height: 3,
+                  margin: const EdgeInsets.symmetric(horizontal: 44),
+                  child: CustomPaint(
+                    painter: _ScrollIndicatorPainter(
+                      totalRange: totalDuration,
+                      visibleStart: visibleStartX - xMin,
+                      visibleEnd: visibleEndX - xMin,
+                      isAtEnd: isLive,
+                    ),
+                  ),
+                ),
+              ),
+
+            // Tombol LIVE di pojok kanan atas
+            Positioned(
+              top: 0,
+              right: 0,
+              child: TextButton(
+                style: TextButton.styleFrom(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  minimumSize: const Size(0, 0),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: canScroll
+                    ? () {
+                        setState(() {
+                          _viewStartX = null; // balik ke live
+                        });
+                      }
+                    : null,
+                child: Text(
+                  "LIVE",
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: isLive
+                        ? Colors.teal
+                        : Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
             ),
-          ),
-          borderData: FlBorderData(show: true),
-          lineBarsData: [
-            LineChartBarData(
-              isCurved: true,
-              spots: data,
-              barWidth: 1.4,
-              dotData: const FlDotData(show: false),
-              color: color,
-            )
           ],
         ),
       ),
@@ -1860,13 +2129,77 @@ class _ValueChart extends StatelessWidget {
   }
 }
 
-class _TempChart extends StatelessWidget {
+// Custom painter for scroll indicator
+class _ScrollIndicatorPainter extends CustomPainter {
+  final double totalRange;
+  final double visibleStart;
+  final double visibleEnd;
+  final bool isAtEnd;
+
+  _ScrollIndicatorPainter({
+    required this.totalRange,
+    required this.visibleStart,
+    required this.visibleEnd,
+    required this.isAtEnd,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (totalRange <= 0) return;
+
+    final paint = Paint()
+      ..color = Colors.grey.withOpacity(0.3)
+      ..style = PaintingStyle.fill;
+
+    // Background track
+    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), paint);
+
+    // Visible window indicator
+    final startFraction = visibleStart / totalRange;
+    final endFraction = visibleEnd / totalRange;
+
+    final indicatorPaint = Paint()
+      ..color = isAtEnd ? Colors.teal : Colors.blue
+      ..style = PaintingStyle.fill;
+
+    final indicatorStart = startFraction * size.width;
+    final indicatorWidth = (endFraction - startFraction) * size.width;
+
+    canvas.drawRect(
+      Rect.fromLTWH(indicatorStart, 0, indicatorWidth, size.height),
+      indicatorPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_ScrollIndicatorPainter oldDelegate) =>
+      oldDelegate.visibleStart != visibleStart ||
+      oldDelegate.visibleEnd != visibleEnd ||
+      oldDelegate.isAtEnd != isAtEnd;
+}
+
+// ============================================================
+// Apply same fixes to Temperature Chart
+// ============================================================
+
+class _TempChart extends StatefulWidget {
   const _TempChart({required this.state});
   final DeviceState state;
 
   @override
+  State<_TempChart> createState() => _TempChartState();
+}
+
+class _TempChartState extends State<_TempChart> {
+  // Show 5 minutes of data at a time
+  // static const Duration _viewWindow = Duration(minutes: 5);
+  // Show 2 minutes of data at a time
+  static const Duration _viewWindow = Duration(minutes: 2);
+  double? _viewStartX;
+
+  @override
   Widget build(BuildContext context) {
-    final items = state.history.items;
+    final items = widget.state.history.items;
 
     if (items.isEmpty) {
       return const Center(child: Text("Tidak ada data"));
@@ -1887,90 +2220,202 @@ class _TempChart extends StatelessWidget {
       }
     }
 
-    final yVals = items.map((e) => e.tempx).toList();
+    final allSpots = [...g, ...y, ...r];
+    if (allSpots.isEmpty) {
+      return const Center(child: Text("Tidak ada data"));
+    }
+
+    final xMin = allSpots.map((e) => e.x).reduce(min);
+    final xMax = allSpots.map((e) => e.x).reduce(max);
+    final totalDuration = xMax - xMin;
+    final viewWindowMs = _viewWindow.inMilliseconds.toDouble();
+
+    double visibleStartX;
+    double visibleEndX;
+
+    // If total data is less than view window, show all data
+    if (totalDuration <= viewWindowMs) {
+      visibleStartX = xMin;
+      visibleEndX = xMax;
+      _viewStartX = null;
+    } else if (_viewStartX == null) {
+      visibleEndX = xMax;
+      visibleStartX = xMax - viewWindowMs;
+    } else {
+      final maxStartX = xMax - viewWindowMs;
+      visibleStartX = _viewStartX!.clamp(xMin, maxStartX);
+      visibleEndX = visibleStartX + viewWindowMs;
+    }
+
+    final visibleSpots = allSpots
+        .where((spot) => spot.x >= visibleStartX && spot.x <= visibleEndX)
+        .toList();
+
+    if (visibleSpots.isEmpty) {
+      return const Center(child: Text("Tidak ada data dalam rentang ini"));
+    }
+
+    final yVals = visibleSpots.map((e) => e.y).toList();
     final yMin = yVals.reduce(min);
     final yMax = yVals.reduce(max);
-    final pad = (yMax - yMin).abs() * 0.1 + 0.1;
+    final padding = max((yMax - yMin) * 0.15, 1.0);
 
-    final xMin = items.first.ts.millisecondsSinceEpoch.toDouble();
-    final xMax = items.last.ts.millisecondsSinceEpoch.toDouble();
+    final canScroll = totalDuration > viewWindowMs;
+    final isLive = _viewStartX == null || !canScroll;
 
-    return Padding(
-      padding: const EdgeInsets.only(top: 6.0, right: 12, bottom: 8),
-      child: LineChart(
-        LineChartData(
-          minX: xMin,
-          maxX: xMax,
-          minY: yMin - pad,
-          maxY: yMax + pad,
-          gridData: const FlGridData(show: true),
-          titlesData: FlTitlesData(
-            leftTitles: const AxisTitles(
-              sideTitles: SideTitles(showTitles: true, reservedSize: 38),
-            ),
-            bottomTitles: AxisTitles(
-              sideTitles: SideTitles(
-                showTitles: true,
-                reservedSize: 26,
-                interval: const Duration(minutes: 3).inMilliseconds.toDouble(),
-                getTitlesWidget: (val, meta) {
-                  final dt = DateTime.fromMillisecondsSinceEpoch(val.toInt());
-                  final hh = dt.hour.toString().padLeft(2, '0');
-                  final mm = dt.minute.toString().padLeft(2, '0');
-                  return Text("$hh:$mm",
-                      style: Theme.of(context).textTheme.bodySmall);
-                },
+    return GestureDetector(
+      onHorizontalDragUpdate: canScroll
+          ? (details) {
+              setState(() {
+                final pixelsPerMs =
+                    MediaQuery.of(context).size.width / viewWindowMs;
+                final deltaMs = -details.delta.dx / pixelsPerMs;
+                final maxStartX = xMax - viewWindowMs;
+
+                if (_viewStartX == null) {
+                  _viewStartX =
+                      (visibleStartX + deltaMs).clamp(xMin, maxStartX);
+                } else {
+                  _viewStartX = (_viewStartX! + deltaMs).clamp(xMin, maxStartX);
+                }
+              });
+            }
+          : null,
+      onHorizontalDragEnd: canScroll ? (_) {} : null,
+      child: Padding(
+        padding: const EdgeInsets.only(top: 6.0, right: 12, bottom: 8),
+        child: Stack(
+          children: [
+            LineChart(
+              LineChartData(
+                minX: visibleStartX,
+                maxX: visibleEndX,
+                minY: yMin - padding,
+                maxY: yMax + padding,
+                gridData: const FlGridData(show: true),
+                titlesData: FlTitlesData(
+                  leftTitles: const AxisTitles(
+                    sideTitles: SideTitles(showTitles: true, reservedSize: 44),
+                  ),
+                  bottomTitles: AxisTitles(
+                    sideTitles: SideTitles(
+                      showTitles: true,
+                      reservedSize: 26,
+                      interval:
+                          const Duration(minutes: 1).inMilliseconds.toDouble(),
+                      getTitlesWidget: (val, meta) {
+                        final dt =
+                            DateTime.fromMillisecondsSinceEpoch(val.toInt());
+                        final hh = dt.hour.toString().padLeft(2, '0');
+                        final mm = dt.minute.toString().padLeft(2, '0');
+                        return Text("$hh:$mm",
+                            style: Theme.of(context).textTheme.bodySmall);
+                      },
+                    ),
+                  ),
+                  rightTitles: const AxisTitles(
+                      sideTitles: SideTitles(showTitles: false)),
+                  topTitles: const AxisTitles(
+                      sideTitles: SideTitles(showTitles: false)),
+                ),
+                lineTouchData: LineTouchData(
+                  enabled: true,
+                  touchTooltipData: LineTouchTooltipData(
+                    getTooltipItems: (spots) {
+                      return spots.map((spot) {
+                        final dt =
+                            DateTime.fromMillisecondsSinceEpoch(spot.x.toInt());
+                        final hh = dt.hour.toString().padLeft(2, '0');
+                        final mm = dt.minute.toString().padLeft(2, '0');
+                        final ss = dt.second.toString().padLeft(2, '0');
+                        return LineTooltipItem(
+                          "$hh:$mm:$ss\n${spot.y.toStringAsFixed(1)}°C",
+                          const TextStyle(color: Colors.white),
+                        );
+                      }).toList();
+                    },
+                  ),
+                ),
+                borderData: FlBorderData(show: true),
+                lineBarsData: [
+                  if (g.isNotEmpty)
+                    LineChartBarData(
+                      isCurved: true,
+                      spots: g,
+                      barWidth: 1.4,
+                      dotData: const FlDotData(show: false),
+                      color: Colors.green,
+                    ),
+                  if (y.isNotEmpty)
+                    LineChartBarData(
+                      isCurved: true,
+                      spots: y,
+                      barWidth: 1.5,
+                      dotData: const FlDotData(show: false),
+                      color: Colors.yellowAccent,
+                    ),
+                  if (r.isNotEmpty)
+                    LineChartBarData(
+                      isCurved: true,
+                      spots: r,
+                      barWidth: 1.6,
+                      dotData: const FlDotData(show: false),
+                      color: Colors.redAccent,
+                    ),
+                ],
               ),
             ),
-            rightTitles:
-                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles:
-                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          ),
-          lineTouchData: LineTouchData(
-            enabled: true,
-            touchTooltipData: LineTouchTooltipData(
-              getTooltipItems: (spots) {
-                return spots.map((spot) {
-                  final dt =
-                      DateTime.fromMillisecondsSinceEpoch(spot.x.toInt());
-                  final hh = dt.hour.toString().padLeft(2, '0');
-                  final mm = dt.minute.toString().padLeft(2, '0');
-                  final ss = dt.second.toString().padLeft(2, '0');
-                  return LineTooltipItem(
-                    "$hh:$mm:$ss\n${spot.y.toStringAsFixed(1)}°C",
-                    const TextStyle(color: Colors.white),
-                  );
-                }).toList();
-              },
+
+            // Scroll indicator overlay (seperti di ValueChart)
+            if (totalDuration > viewWindowMs)
+              Positioned(
+                bottom: 0,
+                left: 0,
+                right: 0,
+                child: Container(
+                  height: 3,
+                  margin: const EdgeInsets.symmetric(horizontal: 44),
+                  child: CustomPaint(
+                    painter: _ScrollIndicatorPainter(
+                      totalRange: totalDuration,
+                      visibleStart: visibleStartX - xMin,
+                      visibleEnd: visibleEndX - xMin,
+                      isAtEnd: isLive,
+                    ),
+                  ),
+                ),
+              ),
+
+            // Tombol LIVE di pojok kanan atas
+            Positioned(
+              top: 0,
+              right: 0,
+              child: TextButton(
+                style: TextButton.styleFrom(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  minimumSize: const Size(0, 0),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: canScroll
+                    ? () {
+                        setState(() {
+                          _viewStartX = null;
+                        });
+                      }
+                    : null,
+                child: Text(
+                  "LIVE",
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: isLive
+                        ? Colors.teal
+                        : Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
             ),
-          ),
-          borderData: FlBorderData(show: true),
-          lineBarsData: [
-            if (g.isNotEmpty)
-              LineChartBarData(
-                isCurved: true,
-                spots: g,
-                barWidth: 1.4,
-                dotData: const FlDotData(show: false),
-                color: Colors.green,
-              ),
-            if (y.isNotEmpty)
-              LineChartBarData(
-                isCurved: true,
-                spots: y,
-                barWidth: 1.5,
-                dotData: const FlDotData(show: false),
-                color: Colors.yellowAccent,
-              ),
-            if (r.isNotEmpty)
-              LineChartBarData(
-                isCurved: true,
-                spots: r,
-                barWidth: 1.6,
-                dotData: const FlDotData(show: false),
-                color: Colors.redAccent,
-              ),
           ],
         ),
       ),
@@ -2000,6 +2445,22 @@ class _EstimateChart extends StatelessWidget {
         ? nowMs + const Duration(minutes: 5).inMilliseconds
         : future.last.x;
 
+    final spanMs = (maxFutureX - minPastX).abs().clamp(1.0, double.infinity);
+
+    double pickIntervalMs(double span) {
+      if (span <= const Duration(hours: 1).inMilliseconds) {
+        return const Duration(minutes: 5).inMilliseconds.toDouble();
+      } else if (span <= const Duration(hours: 4).inMilliseconds) {
+        return const Duration(minutes: 15).inMilliseconds.toDouble();
+      } else if (span <= const Duration(hours: 12).inMilliseconds) {
+        return const Duration(minutes: 30).inMilliseconds.toDouble();
+      } else {
+        return const Duration(hours: 1).inMilliseconds.toDouble();
+      }
+    }
+
+    final intervalMs = pickIntervalMs(spanMs);
+
     return Padding(
       padding: const EdgeInsets.only(top: 6.0, right: 12, bottom: 8),
       child: LineChart(
@@ -2017,7 +2478,7 @@ class _EstimateChart extends StatelessWidget {
               sideTitles: SideTitles(
                 showTitles: true,
                 reservedSize: 26,
-                interval: const Duration(minutes: 30).inMilliseconds.toDouble(),
+                interval: intervalMs,
                 getTitlesWidget: (val, meta) {
                   final dt = DateTime.fromMillisecondsSinceEpoch(val.toInt());
                   final hh = dt.hour.toString().padLeft(2, '0');

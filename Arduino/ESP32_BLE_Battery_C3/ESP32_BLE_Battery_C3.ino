@@ -60,8 +60,8 @@ bool DO_CAL = false;
 #define INA_V_SCALE_E4 10000
 
 // ===== User calibration offsets (apply AFTER sensor read) =====
-// B4 = -99.5f | B5 = -79.5f 
-#define V_OFFSET_mV -79.5f  // e.g. +25.0f adds +25 mV to pack voltage 
+// B4 = -99.5f | B5 = -79.5f
+#define V_OFFSET_mV -79.5f  // e.g. +25.0f adds +25 mV to pack voltage
 // B4 = -39.5f | B5 = -31.0f
 #define I_OFFSET_mA -31.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
 
@@ -178,7 +178,6 @@ void scanI2C();
 void checkOTAToggle();
 void startOTA_AP_Mode();
 void stopOTA_AP_Mode();
-String twoDigit(int n);
 bool runSleepCountdownCancelable(int seconds);
 
 // ================== BLE CALLBACKS ==================
@@ -447,10 +446,7 @@ bool initializeHardware() {
       Serial.print(ina226.getMaxCurrent(), 3);
       Serial.println(" A");
 
-
-
       /* CALIBRATION */
-
       float bv = 0, cu = 0;
       for (int i = 0; i < 10; i++) {
         bv += ina226.getBusVoltage();
@@ -502,7 +498,6 @@ bool initializeHardware() {
       delay(1000);
 
       /* MEASUREMENTS */
-
       Serial.println("\nBUS(V) SHUNT(mV) CURRENT(mA) POWER(mW)");
       for (int i = 0; i < 5; i++) {
         bv = ina226.getBusVoltage();
@@ -617,8 +612,8 @@ void notifyAll(const SensorReadings& readings) {
 }
 
 // ===================== Coulomb Counting =====================
-// Asumsi: currentA positif = DISCHARGE (baterai mengeluarkan arus).
-// Kalau arah arus ternyata kebalik di hardware, ganti sign di sini.
+// ASSUMPTION: currentA > 0 = CHARGING (adds energy to battery)
+//             currentA < 0 = DISCHARGING (removes energy from battery)
 
 void updateCoulombCounting(const SensorReadings& readings) {
   if (!readings.valid) return;
@@ -636,12 +631,12 @@ void updateCoulombCounting(const SensorReadings& readings) {
 
   float packCurrentA = readings.currentA;
 
-  // NOTE: kalau SoC malah naik ketika discharge, ganti:
-  // float packCurrentA = -readings.currentA;
-
-  float deltaAh = (packCurrentA * dtSec) / 3600.0f;  // Ah dalam dt
+  // Positive current = charging = adds to accumulated Ah
+  // Negative current = discharging = subtracts from accumulated Ah
+  float deltaAh = (packCurrentA * dtSec) / 3600.0f;  // Ah in time dt
   coulombAccumulatedAh += deltaAh;
 }
+
 
 // SoC relatif dari Coulomb Counting, anchored ke SoC OCV saat pertama dipakai
 float soc_from_coulomb(float socOcv) {
@@ -655,6 +650,7 @@ float soc_from_coulomb(float socOcv) {
     coulombInitialized = true;
   }
 
+  // Delta SOC from accumulated charge/discharge
   float deltaSocPct = (float)(coulombAccumulatedAh / capAh) * 100.0f;
   float soc = coulombBaseSocPct + deltaSocPct;
 
@@ -663,15 +659,23 @@ float soc_from_coulomb(float socOcv) {
   return soc;
 }
 
+
 // ===================== SoC (OCV-based, sama konsep dengan app) =====================
 
-// Koreksi tegangan ke OCV (open-circuit voltage) dengan resistansi pack.
-// Asumsi: arus positif = DISCHARGE (tegangan turun karena beban).
+// Correct measured voltage to OCV (open-circuit voltage) with pack resistance.
+// ASSUMPTION: currentA > 0 = CHARGING, currentA < 0 = DISCHARGING
 static float pack_ocv_from_vi(float measuredPackVoltageV, float packCurrentA) {
-  // V_ocv ≈ V_meas + I * R_pack
-  //  - Discharge  (I > 0): V_ocv = V_meas + I * R   (angkat tegangan ke atas)
-  //  - Charging   (I < 0): V_ocv = V_meas + I * R   (I negatif => mengurangi tegangan)
-  return measuredPackVoltageV + packCurrentA * R_PACK_OHM();
+  // Under CHARGING (I > 0):
+  //   - Measured voltage is HIGH (V_meas = V_ocv + I*R)
+  //   - To get OCV: V_ocv = V_meas - I*R
+  //
+  // Under DISCHARGING (I < 0):
+  //   - Measured voltage is LOW (V_meas = V_ocv + I*R, but I is negative)
+  //   - To get OCV: V_ocv = V_meas - I*R (subtracting negative = adding)
+  //
+  // Formula is same for both: V_ocv = V_meas - I*R
+  
+  return measuredPackVoltageV - (packCurrentA * R_PACK_OHM());
 }
 
 // Mapping tegangan per-cell -> SoC% dengan 3 titik:
@@ -707,22 +711,24 @@ float estimateSOCpct(float measuredPackVoltageV) {
   // 1) Arus pack rata2 terakhir (untuk koreksi IR)
   float packCurrentA = averagedLast.valid ? averagedLast.currentA : 0.0f;
 
-  // 2) Koreksi ke OCV
-  float packVoltageOCV = pack_ocv_from_vi(measuredPackVoltageV, packCurrentA);
+  // 2) Correct measured voltage to OCV
+  //    This accounts for 4S configuration (series voltage drop)
+  float packVoltageOCV = pack_ocv_from_vi(measuredPackVoltageV, packCurrentA);  
+  // 3) Convert pack OCV to per-cell voltage
+  //    (parallel config doesn't affect voltage, only capacity)
   float cellVoltageV = packVoltageOCV / SERIES_CELLS;
-
-  // 3) SoC dari OCV
+  // 4) Get SOC from per-cell OCV
   float socOcv = soc_from_cell_ocv(cellVoltageV);
 
   // 4) SoC dari Coulomb Counting (anchored ke SoC OCV)
   float socCc = soc_from_coulomb(socOcv);
 
-  // 5) Gabungkan, OCV lebih dominan
+  // 6) Blend: OCV is more reliable (85%), CC for dynamics (15%)
   const float weightOcv = 0.85f;
   const float weightCc = 0.15f;
   float socMix = weightOcv * socOcv + weightCc * socCc;
 
-  // 6) EMA smoothing
+  // 7) Exponential moving average for smoothing
   static bool emaInitialized = false;
   static float socEma = 0.0f;
   if (!emaInitialized) {
@@ -964,11 +970,6 @@ void enterDeepSleep() {
 }
 
 // ================== OTA HELPERS ==================
-
-String twoDigit(int n) {
-  if (n < 10) return "0" + String(n);
-  return String(n);
-}
 
 void startOTA_AP_Mode() {
   if (otaMode) return;
