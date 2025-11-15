@@ -151,7 +151,7 @@ class ParsedReading {
   ParsedReading(this.ts, this.voltx, this.ampx, this.tempx);
 }
 
-/// Sliding window by time (15 minutes)
+/// Sliding window by time (1 jam)
 class TimeSeries {
   final Duration window;
   final List<ParsedReading> _items = [];
@@ -186,6 +186,10 @@ class Estimate {
   final DateTime calcTime;
   final List<FlSpot> futureSeries;
   final List<FlSpot> pastSeries;
+
+  /// Label sumber ETA di UI
+  final String etaMethodLabel;
+
   Estimate({
     required this.charging,
     required this.socNow,
@@ -194,6 +198,7 @@ class Estimate {
     required this.calcTime,
     required this.futureSeries,
     required this.pastSeries,
+    required this.etaMethodLabel,
   });
 }
 
@@ -579,14 +584,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         final isCharging = reading.ampx > 0.0;
 
         // ============================================================
-        // FIX 1: Correct SOC calculation with proper resistance
+        // SOC dari OCV + IR compensation
         // ============================================================
         final socOCV = _socPercentOCV(reading);
 
-        // Coulomb anchored to OCV (firmware-like)
+        // Coulomb anchored ke OCV
         final socCC = _socPercentCC(ds, socOCV);
 
-        // Combine OCV and CC with weighted average (OCV dominates for stability)
+        // Gabung OCV + CC
         final socCombinedRaw = (socOCV * 0.85 + socCC * 0.15).clamp(0.0, 100.0);
 
         ds._socPctEma = _emaNext(
@@ -596,7 +601,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         );
         ds._lastSocTs = reading.ts;
 
-        // Use EMA-smoothed SoC in history for slope/ETA
+        // Simpan history SoC untuk slope / ETA
         ds.socHist.add(MapEntry(reading.ts, ds._socPctEma));
         final cutoff = DateTime.now().subtract(const Duration(minutes: 15));
         while (ds.socHist.isNotEmpty && ds.socHist.first.key.isBefore(cutoff)) {
@@ -650,37 +655,29 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     return (ds._ccBaseSocPct + socDelta).clamp(0.0, 100.0);
   }
 
-  // ============================================================
-  // FIX 1: Correct SOC calculation with proper resistance
-  // ============================================================
+  // SOC berdasar OCV + IR compensation
   double _socPercentOCV(ParsedReading r) {
-    // Calculate pack resistance matching Arduino logic
     final rPerCellMilliOhm = _rCellMilliOhm.clamp(0, 1000);
 
-    // Step 1: Parallel group resistance (cells in parallel)
+    // paralel
     final safeParallel = _parallelCells <= 0 ? 1 : _parallelCells;
     final rGroupMilliOhm = rPerCellMilliOhm / safeParallel;
 
-    // Step 2: Series stack resistance (groups in series)
+    // seri
     final rSeriesMilliOhm = rGroupMilliOhm * _seriesCells;
 
-    // Step 3: Add extra resistance (BMS FETs, wiring, etc.)
-    const rExtraMilliOhm = 60.0; // Same as Arduino R_EXTRA_mOHM
+    // extra (BMS FET, kabel, dsb)
+    const rExtraMilliOhm = 60.0;
     final rPackTotalMilliOhm = rSeriesMilliOhm + rExtraMilliOhm;
-
-    // Convert to Ohms
     final rPackOhm = rPackTotalMilliOhm / 1000.0;
 
-    // IR compensation: positive current = charging
     final isCharging = r.ampx > 0.0;
     final vRestPack = isCharging
-        ? (r.voltx - r.ampx * rPackOhm) // Charging: subtract voltage drop
-        : (r.voltx + r.ampx.abs() * rPackOhm); // Discharging: add voltage drop
+        ? (r.voltx - r.ampx * rPackOhm)
+        : (r.voltx + r.ampx.abs() * rPackOhm);
 
-    // Per-cell voltage
     final vCell = (vRestPack / _seriesCells).clamp(0.0, 1000.0);
 
-    // Map to SOC percentage (3-point curve)
     final vmin = _vMin;
     final vnom = _vNom;
     final vmax = _vMax;
@@ -726,7 +723,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     final n = xs.length;
     final totalSpanSec = xs.last;
     if (totalSpanSec < 30) {
-      // kurang dari 30 detik history -> skip dulu
       return ds.estimate;
     }
 
@@ -755,17 +751,15 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
     final capAh = (_cellMah / 1000.0) * _parallelCells;
 
-    // Threshold
-    const double minSlope = 5e-7; // dipakai kalau harusnya pakai slope
-    const double minCurrA =
-        0.005; // 5 mA, di bawah ini arus dianggap terlalu kecil
-    const double currPriorityThresh =
-        0.01; // >= 10 mA → pakai arus sebagai sumber utama
+    // threshold
+    const double minSlope = 5e-7;
+    const double minCurrA = 0.005;
+    const double currPriorityThresh = 0.01; // >=10mA => utamakan arus
 
     Duration? etaSlope;
     Duration? etaCurrent;
 
-    // --- ETA berbasis slope SoC (opsional) ---
+    // --- ETA dari slope SoC ---
     if (isChargingBySign) {
       if (slope > minSlope) {
         final secondsToFull =
@@ -780,9 +774,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       }
     }
 
-    // --- ETA berbasis arus & kapasitas pack ---
+    // --- ETA dari arus + kapasitas ---
     if (absI > minCurrA && capAh > 0) {
-      final pctPerSec = (absI / (capAh * 3600.0)) * 100.0; // %/detik ideal
+      final pctPerSec = (absI / (capAh * 3600.0)) * 100.0;
       if (pctPerSec > 0) {
         if (isChargingBySign) {
           final secondsToFull =
@@ -796,79 +790,57 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       }
     }
 
-    // Pilih ETA yang dipakai: arus > 10 mA → utamakan arus
     Duration? toFull;
     Duration? toEmpty;
     Duration? chosenEta;
+    String methodLabel = "";
 
     if (isChargingBySign) {
       if (absI >= currPriorityThresh && etaCurrent != null) {
         toFull = etaCurrent;
         chosenEta = etaCurrent;
-        // debug:
-        print(
-            'ETA: Charging via current → ${toFull.inHours}h ${toFull.inMinutes % 60}m');
+        methodLabel = "Berdasarkan arus & kapasitas";
       } else if (etaSlope != null) {
         toFull = etaSlope;
         chosenEta = etaSlope;
-        print(
-            'ETA: Charging via slope → ${toFull.inHours}h ${toFull.inMinutes % 60}m');
+        methodLabel = "Berdasarkan tren SoC";
       } else if (etaCurrent != null) {
         toFull = etaCurrent;
         chosenEta = etaCurrent;
+        methodLabel = "Berdasarkan arus & kapasitas";
       }
     } else {
       if (absI >= currPriorityThresh && etaCurrent != null) {
         toEmpty = etaCurrent;
         chosenEta = etaCurrent;
-        print(
-            'ETA: Discharging via current → ${toEmpty.inHours}h ${toEmpty.inMinutes % 60}m');
+        methodLabel = "Berdasarkan arus & kapasitas";
       } else if (etaSlope != null) {
         toEmpty = etaSlope;
         chosenEta = etaSlope;
-        print(
-            'ETA: Discharging via slope → ${toEmpty.inHours}h ${toEmpty.inMinutes % 60}m');
+        methodLabel = "Berdasarkan tren SoC";
       } else if (etaCurrent != null) {
         toEmpty = etaCurrent;
         chosenEta = etaCurrent;
+        methodLabel = "Berdasarkan arus & kapasitas";
       }
     }
 
-    // Sanity check (boleh kamu kecilkan/perbesar)
-    bool isReasonable(Duration? d) =>
-        d != null && !d.isNegative && d.inHours <= 500;
-
-    // if (isChargingBySign) {
-    //   if (!isReasonable(toFull)) {
-    //     print('ETA: Charging estimate unreasonable');
-    //     return ds.estimate;
-    //   }
-    // } else {
-    //   if (!isReasonable(toEmpty)) {
-    //     print('ETA: Discharge estimate unreasonable');
-    //     return ds.estimate;
-    //   }
-    // }
-
-    // Sanity check versi ringan: cuma buang yang null / negatif
+    // validasi ringan
     if (isChargingBySign) {
       if (toFull == null || toFull.isNegative) {
-        print('ETA: Charging estimate invalid');
         return ds.estimate;
       }
     } else {
       if (toEmpty == null || toEmpty.isNegative) {
-        print('ETA: Discharge estimate invalid');
         return ds.estimate;
       }
     }
 
-    // --- Bangun data untuk chart ---
+    // data untuk line (masih dipakai di perhitungan bar)
     final past = hist
         .map((e) => FlSpot(e.key.millisecondsSinceEpoch.toDouble(), e.value))
         .toList();
 
-    // Untuk garis masa depan, pakai slope yang konsisten dengan ETA terpilih
     double slopeUse;
     if (chosenEta != null && chosenEta.inSeconds > 0) {
       final durSec = chosenEta.inSeconds.toDouble();
@@ -878,14 +850,13 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         slopeUse = -sN / durSec;
       }
     } else {
-      // fallback: pakai slope regresi apa adanya
       slopeUse = slope;
     }
 
     final now = tN;
     final List<FlSpot> future = [];
 
-    const int limitSec = 6 * 3600; // max 6 jam ke depan di chart
+    const int limitSec = 6 * 3600;
     final totalSec = isChargingBySign
         ? min(limitSec, (toFull?.inSeconds ?? 0))
         : min(limitSec, (toEmpty?.inSeconds ?? 0));
@@ -902,11 +873,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       }
     }
 
-    // Debug ringkas
-    print(
-        'ETA Debug: I=${I.toStringAsFixed(3)}A, absI=${absI.toStringAsFixed(3)}A, '
-        'slope=${slope.toStringAsExponential(2)}, charging=$isChargingBySign, '
-        'etaCur=${etaCurrent?.inMinutes}, etaSlope=${etaSlope?.inMinutes}');
+    // print(
+    //     'ETA Debug: I=${I.toStringAsFixed(3)}A, absI=${absI.toStringAsFixed(3)}A, '
+    //         'slope=${slope.toStringAsExponential(2)}, charging=$isChargingBySign, '
+    //         'etaCur=${etaCurrent?.inMinutes}, etaSlope=${etaSlope?.inMinutes}, method=$methodLabel');
 
     return Estimate(
       charging: isChargingBySign,
@@ -916,6 +886,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       calcTime: now,
       futureSeries: future,
       pastSeries: past,
+      etaMethodLabel: methodLabel,
     );
   }
 
@@ -1738,8 +1709,7 @@ class _EstimateCard extends StatelessWidget {
     final dd = eta.day.toString().padLeft(2, '0');
     final monthName = _bulanIndo(eta.month);
     final year = eta.year.toString();
-    // Hasil: "16:08, 16-November-2025"
-    return "$hh:$mm, $dd-$monthName-$year";
+    return "$dd-$monthName-$year, $hh:$mm";
   }
 
   @override
@@ -1752,6 +1722,7 @@ class _EstimateCard extends StatelessWidget {
     String bigTime;
     String sub;
     Color accent;
+    String methodText = est?.etaMethodLabel ?? "";
 
     if (est == null) {
       icon = Icons.info_outline;
@@ -1759,17 +1730,18 @@ class _EstimateCard extends StatelessWidget {
       bigTime = "Belum cukup data";
       sub = "Menunggu tren SoC yang stabil";
       accent = cs.outline;
+      methodText = "";
     } else if (est.charging && est.toFull != null) {
       icon = Icons.battery_charging_full;
       title = "Mengisi Baterai";
       bigTime = _fmtDur(est.toFull!);
-      sub = "Penuh Pada-> ${_fmtEta(est.calcTime, est.toFull!)}";
+      sub = "Penuh => ${_fmtEta(est.calcTime, est.toFull!)}";
       accent = Colors.green;
     } else if (!est.charging && est.toEmpty != null) {
       icon = Icons.timer;
       title = "Estimasi Baterai";
       bigTime = _fmtDur(est.toEmpty!);
-      sub = "Habis Pada-> ${_fmtEta(est.calcTime, est.toEmpty!)}";
+      sub = "Habis => ${_fmtEta(est.calcTime, est.toEmpty!)}";
       accent = Colors.orange;
     } else {
       icon = Icons.insights_outlined;
@@ -1777,6 +1749,7 @@ class _EstimateCard extends StatelessWidget {
       bigTime = "—";
       sub = "Menunggu Arus Berubah Signifikan";
       accent = cs.outline;
+      methodText = "";
     }
 
     return Container(
@@ -1832,6 +1805,18 @@ class _EstimateCard extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(color: cs.onSurfaceVariant),
                 ),
+                if (methodText.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    methodText,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: cs.onSurfaceVariant,
+                          fontStyle: FontStyle.italic,
+                        ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -1893,7 +1878,7 @@ class _ChartPaneState extends State<_ChartPane> {
 }
 
 // ============================================================
-// FIX 2 & 3: Scrollable Charts with Dynamic Y-axis
+// Value / Temp chart (line) – sama seperti sebelumnya
 // ============================================================
 
 class _ValueChart extends StatefulWidget {
@@ -1914,11 +1899,9 @@ class _ValueChart extends StatefulWidget {
 }
 
 class _ValueChartState extends State<_ValueChart> {
-  // Show 5 minutes of data at a time
-  // static const Duration _viewWindow = Duration(minutes: 5);
-  // Show 2 minutes of data at a time
+  // window 2 menit (live + scroll)
   static const Duration _viewWindow = Duration(minutes: 2);
-  double? _viewStartX; // null = show latest data
+  double? _viewStartX; // null = live
 
   @override
   Widget build(BuildContext context) {
@@ -1933,35 +1916,27 @@ class _ValueChartState extends State<_ValueChart> {
       return const Center(child: Text("Tidak ada data"));
     }
 
-    // Full data range
     final xMin = data.first.x;
     final xMax = data.last.x;
     final totalDuration = xMax - xMin;
-
-    // Visible window (2 minutes)
     final viewWindowMs = _viewWindow.inMilliseconds.toDouble();
 
     double visibleStartX;
     double visibleEndX;
 
-    // If total data is less than view window, show all data
     if (totalDuration <= viewWindowMs) {
       visibleStartX = xMin;
       visibleEndX = xMax;
-      // Untuk dataset pendek, kita anggap selalu "live"
       _viewStartX = null;
     } else if (_viewStartX == null) {
-      // Live mode -> selalu show window terakhir
       visibleEndX = xMax;
       visibleStartX = xMax - viewWindowMs;
     } else {
-      // User sedang lihat history, jangan di-override
       final maxStartX = xMax - viewWindowMs;
       visibleStartX = _viewStartX!.clamp(xMin, maxStartX);
       visibleEndX = visibleStartX + viewWindowMs;
     }
 
-    // Filter data points in visible range
     final visibleData = data
         .where((spot) => spot.x >= visibleStartX && spot.x <= visibleEndX)
         .toList();
@@ -1970,13 +1945,10 @@ class _ValueChartState extends State<_ValueChart> {
       return const Center(child: Text("Tidak ada data dalam rentang ini"));
     }
 
-    // Dynamic Y-axis: center around data with padding
     final yVals = visibleData.map((e) => e.y).toList();
     final yMin = yVals.reduce(min);
     final yMax = yVals.reduce(max);
     final yRange = (yMax - yMin).abs();
-
-    // 20% padding, min range 0.2
     final padding = max(yRange * 0.20, 0.1);
     final chartYMin = yMin - padding;
     final chartYMax = yMax + padding;
@@ -1988,7 +1960,6 @@ class _ValueChartState extends State<_ValueChart> {
       onHorizontalDragUpdate: canScroll
           ? (details) {
               setState(() {
-                // Convert pixels to milliseconds (approximate)
                 final pixelsPerMs =
                     MediaQuery.of(context).size.width / viewWindowMs;
                 final deltaMs = -details.delta.dx / pixelsPerMs;
@@ -2003,7 +1974,6 @@ class _ValueChartState extends State<_ValueChart> {
               });
             }
           : null,
-      // Tidak ada auto-snap lagi
       onHorizontalDragEnd: canScroll ? (_) {} : null,
       child: Padding(
         padding: const EdgeInsets.only(top: 6.0, right: 12, bottom: 8),
@@ -2063,7 +2033,7 @@ class _ValueChartState extends State<_ValueChart> {
                 lineBarsData: [
                   LineChartBarData(
                     isCurved: true,
-                    spots: data, // Pass all data, fl_chart handles clipping
+                    spots: data,
                     barWidth: 1.6,
                     dotData: const FlDotData(show: false),
                     color: widget.color,
@@ -2071,8 +2041,6 @@ class _ValueChartState extends State<_ValueChart> {
                 ],
               ),
             ),
-
-            // Scroll indicator overlay
             if (totalDuration > viewWindowMs)
               Positioned(
                 bottom: 0,
@@ -2091,8 +2059,6 @@ class _ValueChartState extends State<_ValueChart> {
                   ),
                 ),
               ),
-
-            // Tombol LIVE di pojok kanan atas
             Positioned(
               top: 0,
               right: 0,
@@ -2106,7 +2072,7 @@ class _ValueChartState extends State<_ValueChart> {
                 onPressed: canScroll
                     ? () {
                         setState(() {
-                          _viewStartX = null; // balik ke live
+                          _viewStartX = null;
                         });
                       }
                     : null,
@@ -2129,7 +2095,6 @@ class _ValueChartState extends State<_ValueChart> {
   }
 }
 
-// Custom painter for scroll indicator
 class _ScrollIndicatorPainter extends CustomPainter {
   final double totalRange;
   final double visibleStart;
@@ -2151,10 +2116,8 @@ class _ScrollIndicatorPainter extends CustomPainter {
       ..color = Colors.grey.withOpacity(0.3)
       ..style = PaintingStyle.fill;
 
-    // Background track
     canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), paint);
 
-    // Visible window indicator
     final startFraction = visibleStart / totalRange;
     final endFraction = visibleEnd / totalRange;
 
@@ -2178,10 +2141,6 @@ class _ScrollIndicatorPainter extends CustomPainter {
       oldDelegate.isAtEnd != isAtEnd;
 }
 
-// ============================================================
-// Apply same fixes to Temperature Chart
-// ============================================================
-
 class _TempChart extends StatefulWidget {
   const _TempChart({required this.state});
   final DeviceState state;
@@ -2191,9 +2150,6 @@ class _TempChart extends StatefulWidget {
 }
 
 class _TempChartState extends State<_TempChart> {
-  // Show 5 minutes of data at a time
-  // static const Duration _viewWindow = Duration(minutes: 5);
-  // Show 2 minutes of data at a time
   static const Duration _viewWindow = Duration(minutes: 2);
   double? _viewStartX;
 
@@ -2233,7 +2189,6 @@ class _TempChartState extends State<_TempChart> {
     double visibleStartX;
     double visibleEndX;
 
-    // If total data is less than view window, show all data
     if (totalDuration <= viewWindowMs) {
       visibleStartX = xMin;
       visibleEndX = xMax;
@@ -2365,8 +2320,6 @@ class _TempChartState extends State<_TempChart> {
                 ],
               ),
             ),
-
-            // Scroll indicator overlay (seperti di ValueChart)
             if (totalDuration > viewWindowMs)
               Positioned(
                 bottom: 0,
@@ -2385,8 +2338,6 @@ class _TempChartState extends State<_TempChart> {
                   ),
                 ),
               ),
-
-            // Tombol LIVE di pojok kanan atas
             Positioned(
               top: 0,
               right: 0,
@@ -2423,115 +2374,310 @@ class _TempChartState extends State<_TempChart> {
   }
 }
 
+// ============================================================
+// ETA BAR CHART ala battery graph HP
+// ============================================================
+
 class _EstimateChart extends StatelessWidget {
   const _EstimateChart({required this.state});
   final DeviceState state;
 
+  double _interpSocFromHist(
+      List<MapEntry<DateTime, double>> hist, DateTime t, double fallback) {
+    if (hist.isEmpty) return fallback;
+    if (t.isBefore(hist.first.key)) return hist.first.value;
+    if (t.isAfter(hist.last.key)) return hist.last.value;
+
+    for (int i = 0; i < hist.length - 1; i++) {
+      final a = hist[i];
+      final b = hist[i + 1];
+      if (!t.isBefore(a.key) && !t.isAfter(b.key)) {
+        final totalMs =
+            (b.key.millisecondsSinceEpoch - a.key.millisecondsSinceEpoch)
+                .toDouble();
+        if (totalMs <= 0) return a.value;
+        final frac =
+            (t.millisecondsSinceEpoch - a.key.millisecondsSinceEpoch) / totalMs;
+        return a.value + (b.value - a.value) * frac;
+      }
+    }
+    return hist.last.value;
+  }
+
+  // cari arus “terdekat” di sekitar waktu t
+  double _currentAt(DeviceState state, DateTime t) {
+    final readings = state.history.items;
+    if (readings.isEmpty) return 0.0;
+
+    ParsedReading closest = readings.first;
+    int bestDiff = (t.difference(closest.ts).inMilliseconds).abs();
+
+    for (final r in readings) {
+      final diff = (t.difference(r.ts).inMilliseconds).abs();
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        closest = r;
+      }
+    }
+    return closest.ampx;
+  }
+
+  String _formatBottomLabel(DateTime time, Duration span) {
+    if (span.inDays >= 2) {
+      final d = time.day.toString().padLeft(2, '0');
+      final m = time.month.toString().padLeft(2, '0');
+      return "$d/$m";
+    } else {
+      final h = time.hour.toString().padLeft(2, '0');
+      final m = time.minute.toString().padLeft(2, '0');
+      return "$h:$m";
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
     final est = state.estimate;
-    final past = est?.pastSeries ?? [];
-    final future = est?.futureSeries ?? [];
+    final hist = state.socHist;
 
-    if (past.isEmpty && future.isEmpty) {
+    if (est == null && hist.isEmpty) {
       return const Center(child: Text("Belum ada estimasi"));
     }
 
-    final nowMs = DateTime.now().millisecondsSinceEpoch.toDouble();
-    final minPastX = past.isEmpty
-        ? nowMs - const Duration(minutes: 5).inMilliseconds
-        : past.first.x;
-    final maxFutureX = future.isEmpty
-        ? nowMs + const Duration(minutes: 5).inMilliseconds
-        : future.last.x;
+    final now = est?.calcTime ?? DateTime.now();
 
-    final spanMs = (maxFutureX - minPastX).abs().clamp(1.0, double.infinity);
+    // start: earliest SoC history (maks 15 menit ke belakang)
+    final pastStart = hist.isNotEmpty
+        ? hist.first.key
+        : now.subtract(const Duration(minutes: 15));
 
-    double pickIntervalMs(double span) {
-      if (span <= const Duration(hours: 1).inMilliseconds) {
-        return const Duration(minutes: 5).inMilliseconds.toDouble();
-      } else if (span <= const Duration(hours: 4).inMilliseconds) {
-        return const Duration(minutes: 15).inMilliseconds.toDouble();
-      } else if (span <= const Duration(hours: 12).inMilliseconds) {
-        return const Duration(minutes: 30).inMilliseconds.toDouble();
+    // apakah ETA valid?
+    final bool hasEta;
+    Duration etaDur;
+
+    if (est != null) {
+      if (est.charging && est.toFull != null && !est.toFull!.isNegative) {
+        hasEta = true;
+        etaDur = est.toFull!;
+      } else if (!est.charging &&
+          est.toEmpty != null &&
+          !est.toEmpty!.isNegative) {
+        hasEta = true;
+        etaDur = est.toEmpty!;
       } else {
-        return const Duration(hours: 1).inMilliseconds.toDouble();
+        hasEta = false;
+        etaDur = Duration.zero;
       }
+    } else {
+      hasEta = false;
+      etaDur = Duration.zero;
     }
 
-    final intervalMs = pickIntervalMs(spanMs);
+    // end: waktu ETA kalau ada; kalau tidak, mentok di "now" saja
+    final futureEnd = hasEta ? now.add(etaDur) : now;
+    final totalSpan = futureEnd.difference(pastStart);
 
-    return Padding(
-      padding: const EdgeInsets.only(top: 6.0, right: 12, bottom: 8),
-      child: LineChart(
-        LineChartData(
-          minX: minPastX,
-          maxX: maxFutureX,
-          minY: 0,
-          maxY: 100,
-          gridData: const FlGridData(show: true),
-          titlesData: FlTitlesData(
-            leftTitles: const AxisTitles(
-              sideTitles: SideTitles(showTitles: true, reservedSize: 36),
-            ),
-            bottomTitles: AxisTitles(
-              sideTitles: SideTitles(
-                showTitles: true,
-                reservedSize: 26,
-                interval: intervalMs,
-                getTitlesWidget: (val, meta) {
-                  final dt = DateTime.fromMillisecondsSinceEpoch(val.toInt());
-                  final hh = dt.hour.toString().padLeft(2, '0');
-                  final mm = dt.minute.toString().padLeft(2, '0');
-                  return Text("$hh:$mm",
-                      style: Theme.of(context).textTheme.bodySmall);
-                },
+    if (totalSpan.isNegative || totalSpan.inSeconds == 0) {
+      return const Center(child: Text("Rentang waktu estimasi tidak valid"));
+    }
+
+    const int bucketCount = 36;
+    final totalMs = totalSpan.inMilliseconds.toDouble();
+    final bucketMs = totalMs / bucketCount;
+
+    final groups = <BarChartGroupData>[];
+
+    for (int i = 0; i < bucketCount; i++) {
+      final centerMs =
+          pastStart.millisecondsSinceEpoch + ((i + 0.5) * bucketMs).round();
+      final centerTime = DateTime.fromMillisecondsSinceEpoch(centerMs);
+
+      final bool isFuture = hasEta && centerTime.isAfter(now);
+
+      double socVal;
+      Color color;
+
+      if (!isFuture) {
+        // BAR HISTORY – pakai SoC history, warna dari arus saat itu
+        final halfBucket = Duration(milliseconds: (bucketMs / 2).round());
+        final t0 = centerTime.subtract(halfBucket);
+        final t1 = centerTime.add(halfBucket);
+        final s0 = _interpSocFromHist(hist, t0, est?.socNow ?? 50.0);
+        final s1 = _interpSocFromHist(hist, t1, est?.socNow ?? 50.0);
+        socVal = s1.clamp(0.0, 100.0);
+
+        final I = _currentAt(state, centerTime);
+
+        if (I > 0.002) {
+          // charging
+          color = Colors.greenAccent.shade400;
+        } else if (I < -0.002) {
+          // usage
+          color = Colors.lightBlueAccent.shade400;
+        } else {
+          color = Colors.grey.withOpacity(0.35);
+        }
+      } else {
+        // BAR ETA – hanya kalau ETA benar-benar ada
+        if (!hasEta || etaDur.inSeconds == 0) continue;
+
+        final elapsed = centerTime.difference(now).inMilliseconds.toDouble();
+        final frac = (elapsed / etaDur.inMilliseconds).clamp(0.0, 1.0);
+
+        final targetSoc = est!.charging ? 100.0 : 0.0;
+        final startSoc = est.socNow;
+        socVal = (startSoc + (targetSoc - startSoc) * frac).clamp(0.0, 100.0);
+
+        color = est.charging
+            ? Colors.teal.withOpacity(0.55)
+            : Colors.grey.withOpacity(0.55);
+      }
+
+      groups.add(
+        BarChartGroupData(
+          x: i,
+          barRods: [
+            BarChartRodData(
+              toY: socVal,
+              fromY: 0,
+              width: 6,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(2),
               ),
+              color: color,
             ),
-            rightTitles:
-                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles:
-                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          ),
-          lineTouchData: LineTouchData(
-            enabled: true,
-            touchTooltipData: LineTouchTooltipData(
-              getTooltipItems: (spots) {
-                return spots.map((spot) {
-                  final dt =
-                      DateTime.fromMillisecondsSinceEpoch(spot.x.toInt());
-                  final hh = dt.hour.toString().padLeft(2, '0');
-                  final mm = dt.minute.toString().padLeft(2, '0');
-                  return LineTooltipItem(
-                    "$hh:$mm\n${spot.y.toStringAsFixed(1)}%",
-                    const TextStyle(color: Colors.white),
-                  );
-                }).toList();
-              },
-            ),
-          ),
-          borderData: FlBorderData(show: true),
-          lineBarsData: [
-            if (past.isNotEmpty)
-              LineChartBarData(
-                isCurved: true,
-                spots: past,
-                barWidth: 1.6,
-                dotData: const FlDotData(show: false),
-                color: Colors.teal,
-              ),
-            if (future.isNotEmpty)
-              LineChartBarData(
-                isCurved: true,
-                spots: future,
-                barWidth: 1.6,
-                dotData: const FlDotData(show: false),
-                color: Colors.grey,
-                dashArray: [5, 5],
-              ),
           ],
         ),
-      ),
+      );
+    }
+
+    if (groups.isEmpty) {
+      return const Center(child: Text("Belum ada data untuk ETA chart"));
+    }
+
+    final span = totalSpan;
+
+    return Column(
+      children: [
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.only(top: 65.0, right: 10, bottom: 2),
+            child: BarChart(
+              BarChartData(
+                maxY: 100,
+                minY: 0,
+                barGroups: groups,
+                gridData: const FlGridData(show: true),
+                titlesData: FlTitlesData(
+                  leftTitles: const AxisTitles(
+                    sideTitles: SideTitles(showTitles: true, reservedSize: 36),
+                  ),
+                  rightTitles: const AxisTitles(
+                      sideTitles: SideTitles(showTitles: false)),
+                  topTitles: const AxisTitles(
+                      sideTitles: SideTitles(showTitles: false)),
+                  bottomTitles: AxisTitles(
+                    sideTitles: SideTitles(
+                      showTitles: true,
+                      reservedSize: 26,
+                      getTitlesWidget: (value, meta) {
+                        final i = value.round();
+                        if (i < 0 || i >= bucketCount) {
+                          return const SizedBox.shrink();
+                        }
+
+                        DateTime timeForIndex(int idx) {
+                          final ms = pastStart.millisecondsSinceEpoch +
+                              ((idx + 0.5) * bucketMs).round();
+                          return DateTime.fromMillisecondsSinceEpoch(ms);
+                        }
+
+                        String label;
+                        if (i == 0) {
+                          label = _formatBottomLabel(timeForIndex(0), span);
+                        } else if (i == bucketCount ~/ 2 && hasEta) {
+                          label = "";
+                        } else if (i == bucketCount - 1 && hasEta) {
+                          label = _formatBottomLabel(
+                              timeForIndex(bucketCount - 1), span);
+                        } else {
+                          return const SizedBox.shrink();
+                        }
+
+                        return Text(
+                          label,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        );
+                      },
+                    ),
+                  ),
+                ),
+                borderData: FlBorderData(show: true),
+                barTouchData: BarTouchData(
+                  enabled: true,
+                  touchTooltipData: BarTouchTooltipData(
+                    getTooltipItem: (group, groupIndex, rod, rodIndex) {
+                      final idx = group.x;
+                      final ms = pastStart.millisecondsSinceEpoch +
+                          ((idx + 0.5) * bucketMs).round();
+                      final t = DateTime.fromMillisecondsSinceEpoch(ms);
+
+                      final dd = t.day.toString().padLeft(2, '0');
+                      final mo = t.month.toString().padLeft(2, '0');
+                      final yy = t.year.toString();
+                      final hh = t.hour.toString().padLeft(2, '0');
+                      final mm = t.minute.toString().padLeft(2, '0');
+                      final ss = t.second.toString().padLeft(2, '0');
+
+                      final tsLabel = "$dd/$mo/$yy $hh:$mm:$ss";
+
+                      return BarTooltipItem(
+                        "$tsLabel\n${rod.toY.toStringAsFixed(1)}%",
+                        const TextStyle(color: Colors.white),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            _LegendDot(color: Colors.greenAccent.shade400),
+            const SizedBox(width: 4),
+            Text("Mengisi", style: TextStyle(color: cs.onSurfaceVariant)),
+            const SizedBox(width: 12),
+            _LegendDot(color: Colors.lightBlueAccent),
+            const SizedBox(width: 4),
+            Text("Penggunaan", style: TextStyle(color: cs.onSurfaceVariant)),
+            const SizedBox(width: 12),
+            _LegendDot(
+                color: hasEta && est != null && est.charging
+                    ? Colors.teal.withOpacity(0.55)
+                    : Colors.grey.withOpacity(0.55)),
+            const SizedBox(width: 4),
+            Text("ETA", style: TextStyle(color: cs.onSurfaceVariant)),
+          ],
+        ),
+        const SizedBox(height: 4),
+      ],
+    );
+  }
+}
+
+class _LegendDot extends StatelessWidget {
+  const _LegendDot({required this.color});
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 10,
+      height: 10,
+      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
     );
   }
 }
