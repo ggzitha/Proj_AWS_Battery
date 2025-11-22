@@ -28,7 +28,17 @@ final Uuid kServiceUuid = Uuid.parse("91bad492-b950-4226-aa2b-4ede9fa42f59");
 final Uuid kCharUuid = Uuid.parse("cba1d466-344c-4be3-ab3f-189daa0a16d8");
 
 /// Target device names (no MAC hardcoding)
-const targetNames = {"BATT-Mon_4", "BATT-Mon_5", "BATT-Mon_6"};
+const targetNames = {
+  "BATT-Mon_1",
+  "BATT-Mon_2",
+  "BATT-Mon_3",
+  "BATT-Mon_4",
+  "BATT-Mon_5",
+  "BATT-Mon_6",
+  "BATT-Mon_7",
+  "BATT-Mon_8",
+  "BATT-Mon_9"
+};
 
 /// DB helper (single-row settings)
 class AppDb {

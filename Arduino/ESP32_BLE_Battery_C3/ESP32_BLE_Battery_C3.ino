@@ -14,7 +14,7 @@
 #include <ArduinoOTA.h>
 
 // ===================== CONFIG =====================
-#define DEVICE_NUM 6          // 4 / 5 / 6 -> used in names
+#define DEVICE_NUM 8          // 4 / 5 / 6 -> used in names
 #define WAKE_UP_BUTTON_PIN 2  // Button to GND; we use pull-up and wake on LOW
 #define USE_EXT0_WAKEUP 0     // Keep 0 (EXT1/GPIO wake) on C3
 
@@ -60,10 +60,10 @@ bool DO_CAL = false;
 #define INA_V_SCALE_E4 10000
 
 // ===== User calibration offsets (apply AFTER sensor read) =====
-// B4 = -99.5f | B5 = -79.5f | B6 = -74.5f
-#define V_OFFSET_mV -74.5f  // e.g. +25.0f adds +25 mV to pack voltage
-// B4 = -39.5f | B5 = -31.0f | B6 = -19.0f
-#define I_OFFSET_mA -19.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
+// B4 = 0.0f | B5 = -79.5f | B6 = -74.5f | B8 = 0.0f
+#define V_OFFSET_mV 0.0f  // e.g. +25.0f adds +25 mV to pack voltage
+// B4 = -15.0f | B5 = -31.0f | B6 = -19.0f | B8 = -60.0f
+#define I_OFFSET_mA -60.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
 
 // ===== Load compensation + smoothing (SoC under load) =====
 // LiitoKala spec: internal resistance <17 mΩ / cell
