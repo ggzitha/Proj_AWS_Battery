@@ -68,7 +68,7 @@ class AppDb {
         ''');
         await db.insert('settings', {
           'id': 1,
-          'vmin': 2.70,
+          'vmin': 2.75,
           'vnom': 3.60,
           'vmax': 4.20,
           'series': 4,
@@ -117,7 +117,7 @@ class AppDb {
     await _db!.update(
       'settings',
       {
-        'vmin': 2.70,
+        'vmin': 2.75,
         'vnom': 3.60,
         'vmax': 4.20,
         'series': 4,
@@ -212,6 +212,41 @@ class Estimate {
   });
 }
 
+/// Kalman filter 1D sederhana untuk SoC
+class KalmanFilter {
+  double q; // process noise
+  double r; // measurement noise
+  double x; // state (SoC)
+  double p; // estimation error covariance
+  double k; // kalman gain
+
+  KalmanFilter({
+    required this.q,
+    required this.r,
+    double initialValue = 50.0,
+    double initialError = 10.0,
+  })  : x = initialValue,
+        p = initialError,
+        k = 0.0;
+
+  void reset(double value) {
+    x = value;
+    p = 1.0;
+    k = 0.0;
+  }
+
+  double update(double measurement) {
+    // prediction
+    p = p + q;
+
+    // update
+    k = p / (p + r);
+    x = x + k * (measurement - x);
+    p = (1 - k) * p;
+    return x;
+  }
+}
+
 class DeviceState {
   final DiscoveredDevice device;
   StreamSubscription<ConnectionStateUpdate>? connSub;
@@ -240,6 +275,15 @@ class DeviceState {
   // Anchor Coulomb seperti firmware (first OCV)
   bool _ccInitialized = false;
   double _ccBaseSocPct = 50.0;
+
+  // Kalman filter untuk SoC (setelan awal)
+  final KalmanFilter kalman = KalmanFilter(
+    q: 0.02, // noise proses (perubahan SoC)
+    r: 0.25, // noise measurement (tegangan/INA)
+    initialValue: 50.0,
+    initialError: 10.0,
+  );
+  bool kalmanInit = false;
 
   // RAW capture
   String? lastRaw;
@@ -287,7 +331,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   // Settings
   double _vMax = 4.20;
   double _vNom = 3.60;
-  double _vMin = 2.70;
+  double _vMin = 2.75;
   int _seriesCells = 4;
   int _parallelCells = 3;
   int _cellMah = 4000;
@@ -359,7 +403,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _cellMah = (m['cell_mah'] as num).toInt().clamp(500, 100000);
       _rCellMilliOhm = (m['r_cell_milliohm'] as num).toDouble().clamp(0, 1000);
       if (!(_vMin < _vNom && _vNom < _vMax)) {
-        _vMin = 2.70;
+        _vMin = 2.75;
         _vNom = 3.60;
         _vMax = 4.20;
       }
@@ -437,7 +481,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           ds.tabCtl.attach(this);
           ds.userWantsConnection = true; // auto-connect first discovery
           _devices[d.id] = ds;
-          setState(() {});
+          if (mounted) {
+            setState(() {});
+          }
           _connectAndSubscribe(ds);
         } else {
           final ds = _devices[d.id]!;
@@ -446,6 +492,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           }
         }
       }, onError: (e) {
+        if (!mounted) return;
         _snack("Scan error: $e");
       });
     } catch (e) {
@@ -474,6 +521,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     ds.error = null;
     ds.lastDisconnectTime = null;
     await ds.connSub?.cancel();
+    ds.connSub = null;
 
     try {
       ds.connSub = _ble
@@ -483,6 +531,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       )
           .listen((update) {
         if (!mounted) return;
+        if (!ds.userWantsConnection) {
+          // user already requested disconnect, ignore callback
+          return;
+        }
         switch (update.connectionState) {
           case DeviceConnectionState.connected:
             ds.connected = true;
@@ -502,6 +554,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
             break;
         }
       }, onError: (e) {
+        if (!mounted) return;
         ds.error = "Gagal Menghubungkan: $e";
         ds.connected = false;
         ds.lastDisconnectTime = DateTime.now();
@@ -511,7 +564,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       ds.error = "Gagal Menghubungkan: $e";
       ds.connected = false;
       ds.lastDisconnectTime = DateTime.now();
-      setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     }
   }
 
@@ -565,6 +620,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   void _subscribe(DeviceState ds) {
     ds.notifySub?.cancel();
+    ds.notifySub = null;
 
     final ch = QualifiedCharacteristic(
       deviceId: ds.device.id,
@@ -573,6 +629,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
 
     ds.notifySub = _ble.subscribeToCharacteristic(ch).listen((data) {
+      // extra guards for lifecycle & user intent
+      if (!mounted) return;
+      if (!ds.userWantsConnection) return;
+      if (!ds.connected) return;
+
       try {
         final raw = String.fromCharCodes(data)
             .replaceAll(RegExp(r'[\x00-\x1F]'), ' ')
@@ -594,28 +655,47 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         final isCharging = reading.ampx > 0.0;
 
         // ============================================================
-        // SOC dari OCV + IR compensation
+        // SOC dari OCV + IR compensation + CC
         // ============================================================
         final socOCV = _socPercentOCV(reading);
-
-        // Coulomb anchored ke OCV
         final socCC = _socPercentCC(ds, socOCV);
 
-        // Gabung OCV + CC
+        // Gabung OCV + CC (raw)
         final socCombinedRaw = (socOCV * 0.85 + socCC * 0.15).clamp(0.0, 100.0);
 
-        ds._socPctEma = _emaNext(
+        // ============================================================
+        // Kombinasi EMA + Kalman filter
+        // ============================================================
+        // 1) EMA smoothing untuk meredam jitter jangka pendek
+        final emaSoC = _emaNext(
           ds._socPctEma,
           socCombinedRaw,
           (isCharging ? _emaAlphaCharge : _emaAlphaDischarge),
         );
+
+        // 2) Inisialisasi Kalman dengan nilai EMA pertama
+        if (!ds.kalmanInit) {
+          ds.kalman.reset(emaSoC);
+          ds.kalmanInit = true;
+        }
+
+        // 3) Kalman filter untuk SoC super smooth stabil
+        final socKalman = ds.kalman.update(emaSoC).clamp(0.0, 100.0);
+
+        ds._socPctEma = socKalman;
         ds._lastSocTs = reading.ts;
 
-        // Simpan history SoC untuk slope / ETA
+        // Simpan history SoC (sudah Kalman) untuk slope / ETA
         ds.socHist.add(MapEntry(reading.ts, ds._socPctEma));
+
+        // Efficient prune: remove prefix in one go instead of removeAt(0) loop
         final cutoff = DateTime.now().subtract(const Duration(minutes: 15));
-        while (ds.socHist.isNotEmpty && ds.socHist.first.key.isBefore(cutoff)) {
-          ds.socHist.removeAt(0);
+        final idx = ds.socHist.indexWhere((e) => !e.key.isBefore(cutoff));
+        if (idx == -1) {
+          // semua terlalu lama
+          ds.socHist.clear();
+        } else if (idx > 0) {
+          ds.socHist.removeRange(0, idx);
         }
 
         if (ds.socHist.length >= 5 &&
@@ -630,6 +710,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         if (mounted) setState(() {});
       }
     }, onError: (e) {
+      if (!mounted) return;
       ds.error = "Notifikasi error: $e";
       if (mounted) setState(() {});
     });
@@ -651,7 +732,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   double _socPercentCC(DeviceState ds, double socOcvNow) {
-    final capAh = (_cellMah / 1000.0) * _parallelCells;
+    final safeParallel = _parallelCells <= 0 ? 1 : _parallelCells;
+    final capAh = (_cellMah / 1000.0) * safeParallel;
     if (capAh <= 0) return socOcvNow.clamp(0.0, 100.0);
 
     if (!ds._ccInitialized) {
@@ -673,8 +755,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     final safeParallel = _parallelCells <= 0 ? 1 : _parallelCells;
     final rGroupMilliOhm = rPerCellMilliOhm / safeParallel;
 
-    // seri
-    final rSeriesMilliOhm = rGroupMilliOhm * _seriesCells;
+    // seri (extra guard to avoid 0-division)
+    final safeSeries = _seriesCells <= 0 ? 1 : _seriesCells;
+    final rSeriesMilliOhm = rGroupMilliOhm * safeSeries;
 
     // extra (BMS FET, kabel, dsb)
     const rExtraMilliOhm = 60.0;
@@ -686,7 +769,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         ? (r.voltx - r.ampx * rPackOhm)
         : (r.voltx + r.ampx.abs() * rPackOhm);
 
-    final vCell = (vRestPack / _seriesCells).clamp(0.0, 1000.0);
+    final vCell = (vRestPack / safeSeries).clamp(0.0, 1000.0);
 
     final vmin = _vMin;
     final vnom = _vNom;
@@ -732,7 +815,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
     final n = xs.length;
     final totalSpanSec = xs.last;
-    if (totalSpanSec < 30) {
+    final viewSec = const Duration(minutes: 5).inSeconds.toDouble();
+    if (totalSpanSec < 30 || totalSpanSec < viewSec * 0.1) {
       return ds.estimate;
     }
 
@@ -752,14 +836,15 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
 
     final slope = num / den; // % per detik
-    final sN = ys.last; // SoC % terakhir (smoothed)
+    final sN = ys.last; // SoC % terakhir (sudah Kalman/EMA)
     final tN = t0.add(Duration(milliseconds: (xs.last * 1000).round()));
 
     final I = (ds.last?.ampx ?? 0.0);
     final absI = I.abs();
     final isChargingBySign = I > 0.0;
 
-    final capAh = (_cellMah / 1000.0) * _parallelCells;
+    final safeParallel = _parallelCells <= 0 ? 1 : _parallelCells;
+    final capAh = (_cellMah / 1000.0) * safeParallel;
 
     // threshold
     const double minSlope = 5e-7;
@@ -883,10 +968,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       }
     }
 
-    // print(
-    //     'ETA Debug: I=${I.toStringAsFixed(3)}A, absI=${absI.toStringAsFixed(3)}A, '
-    //         'slope=${slope.toStringAsExponential(2)}, charging=$isChargingBySign, '
-    //         'etaCur=${etaCurrent?.inMinutes}, etaSlope=${etaSlope?.inMinutes}, method=$methodLabel');
+    print('DEBUG ETA: capAh=$capAh Ah, I=$I A, absI=$absI A, '
+        'socNow=$sN %, method=$methodLabel, '
+        'etaCurHours=${etaCurrent?.inHours}, etaSlopeHours=${etaSlope?.inHours}');
 
     return Estimate(
       charging: isChargingBySign,
@@ -920,7 +1004,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       ds.connected = false;
       ds.lastDisconnectTime = DateTime.now();
 
-      setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     } else {
       ds.userWantsConnection = true;
 
@@ -1036,7 +1122,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               const SizedBox(height: 6),
               Row(
                 children: [
-                  Expanded(child: Text("Default 2.70", style: captionStyle)),
+                  Expanded(child: Text("Default 2.75", style: captionStyle)),
                   Expanded(
                       child: Center(
                           child: Text("Default 3.60", style: captionStyle))),
@@ -1418,7 +1504,7 @@ class _DeviceAccordion extends StatelessWidget {
                 padding: const EdgeInsets.all(10),
                 margin: const EdgeInsets.only(bottom: 10),
                 decoration: BoxDecoration(
-                  color: Colors.red.withValues(alpha: .08),
+                  color: Colors.red.withOpacity(.08),
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(state.error!,
@@ -1653,7 +1739,7 @@ class _MetricTile extends StatelessWidget {
           BoxShadow(
               blurRadius: 6,
               offset: const Offset(0, 1),
-              color: cs.shadow.withValues(alpha: 0.05))
+              color: cs.shadow.withOpacity(0.05))
         ],
       ),
       child: Row(
@@ -1773,7 +1859,7 @@ class _EstimateCard extends StatelessWidget {
           BoxShadow(
               blurRadius: 6,
               offset: const Offset(0, 1),
-              color: cs.shadow.withValues(alpha: 0.05))
+              color: cs.shadow.withOpacity(0.05))
         ],
       ),
       child: Row(
@@ -1782,7 +1868,7 @@ class _EstimateCard extends StatelessWidget {
             width: 38,
             height: 38,
             decoration: BoxDecoration(
-              color: accent.withValues(alpha: 0.12),
+              color: accent.withOpacity(0.12),
               borderRadius: BorderRadius.circular(10),
             ),
             child: Icon(icon, color: accent),

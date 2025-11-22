@@ -14,7 +14,7 @@
 #include <ArduinoOTA.h>
 
 // ===================== CONFIG =====================
-#define DEVICE_NUM 8          // 4 / 5 / 6 -> used in names
+#define DEVICE_NUM 4          // 4 / 5 / 6 -> used in names
 #define WAKE_UP_BUTTON_PIN 2  // Button to GND; we use pull-up and wake on LOW
 #define USE_EXT0_WAKEUP 0     // Keep 0 (EXT1/GPIO wake) on C3
 
@@ -26,7 +26,7 @@
 // BMS estimate for OLED bars (app does precise logic)
 #define SERIES_CELLS 4
 #define PARALLEL_CELLS 3
-#define PCELL_VMIN 2.70f
+#define PCELL_VMIN 2.75f
 #define PCELL_VNOM 3.60f
 #define PCELL_VMAX 4.20f
 
@@ -62,8 +62,8 @@ bool DO_CAL = false;
 // ===== User calibration offsets (apply AFTER sensor read) =====
 // B4 = 0.0f | B5 = -79.5f | B6 = -74.5f | B8 = 0.0f
 #define V_OFFSET_mV 0.0f  // e.g. +25.0f adds +25 mV to pack voltage
-// B4 = -15.0f | B5 = -31.0f | B6 = -19.0f | B8 = -60.0f
-#define I_OFFSET_mA -60.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
+// B4 = 14.0f | B5 = -31.0f | B6 = -19.0f | B8 = -98.0f
+#define I_OFFSET_mA 14.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
 
 // ===== Load compensation + smoothing (SoC under load) =====
 // LiitoKala spec: internal resistance <17 mΩ / cell
@@ -155,6 +155,48 @@ double coulombAccumulatedAh = 0.0;  // Ah netto sejak anchor
 unsigned long lastCoulombMs = 0;    // timestamp terakhir update CC
 bool coulombInitialized = false;    // sudah pernah di-anchor?
 float coulombBaseSocPct = 50.0f;    // SoC anchor dari OCV pertama kali
+
+// ========== 1D KALMAN FILTER UNTUK SoC (SAMA KONSEP DENGAN APP) ==========
+struct Kalman1D {
+  float q;  // process noise
+  float r;  // measurement noise
+  float x;  // state (SoC)
+  float p;  // estimation error covariance
+  float k;  // kalman gain
+  bool initialized;
+
+  Kalman1D()
+      : q(0.02f),  // cukup kecil biar smooth tapi masih bisa adapt
+        r(0.25f),
+        x(50.0f),
+        p(10.0f),
+        k(0.0f),
+        initialized(false) {}
+
+  void reset(float value) {
+    x = value;
+    p = 10.0f;
+    k = 0.0f;
+    initialized = true;
+  }
+
+  float update(float measurement) {
+    if (!initialized) {
+      reset(measurement);
+      return x;
+    }
+    // prediction
+    p = p + q;
+    // update
+    k = p / (p + r);
+    x = x + k * (measurement - x);
+    p = (1.0f - k) * p;
+    return x;
+  }
+};
+
+// Satu global filter untuk SoC pack
+Kalman1D g_socKalman;
 
 // ======== Prototypes ========
 bool initializeHardware();
@@ -706,41 +748,46 @@ static float soc_from_cell_ocv(float cellVoltageV) {
   return socPct;
 }
 
-// Estimasi SoC pack (OCV + Coulomb + EMA; tanpa absolute Ah kalibrasi penuh)
+// Estimasi SoC pack (OCV + Coulomb + EMA + KALMAN)
 float estimateSOCpct(float measuredPackVoltageV) {
   // 1) Arus pack rata2 terakhir (untuk koreksi IR)
   float packCurrentA = averagedLast.valid ? averagedLast.currentA : 0.0f;
 
   // 2) Correct measured voltage to OCV
-  //    This accounts for 4S configuration (series voltage drop)
   float packVoltageOCV = pack_ocv_from_vi(measuredPackVoltageV, packCurrentA);  
+
   // 3) Convert pack OCV to per-cell voltage
-  //    (parallel config doesn't affect voltage, only capacity)
   float cellVoltageV = packVoltageOCV / SERIES_CELLS;
-  // 4) Get SOC from per-cell OCV
+
+  // 4) SoC dari per-cell OCV
   float socOcv = soc_from_cell_ocv(cellVoltageV);
 
-  // 4) SoC dari Coulomb Counting (anchored ke SoC OCV)
+  // 5) SoC dari Coulomb Counting (anchored ke SoC OCV)
   float socCc = soc_from_coulomb(socOcv);
 
-  // 6) Blend: OCV is more reliable (85%), CC for dynamics (15%)
+  // 6) Blend: OCV is more reliable (85%), CC untuk dinamika (15%)
   const float weightOcv = 0.85f;
   const float weightCc = 0.15f;
   float socMix = weightOcv * socOcv + weightCc * socCc;
 
-  // 7) Exponential moving average for smoothing
+  // 7) Exponential moving average (EMA) terlebih dahulu
   static bool emaInitialized = false;
   static float socEma = 0.0f;
   if (!emaInitialized) {
     socEma = socMix;
     emaInitialized = true;
+    // Sekalian reset Kalman dengan nilai awal ini
+    g_socKalman.reset(socEma);
   } else {
     socEma = SOC_EMA_ALPHA * socMix + (1.0f - SOC_EMA_ALPHA) * socEma;
   }
 
-  if (socEma < 0.0f) socEma = 0.0f;
-  if (socEma > 100.0f) socEma = 100.0f;
-  return socEma;
+  // 8) Kalman filter di atas EMA — super smoothing seperti di Flutter
+  float socKal = g_socKalman.update(socEma);
+
+  if (socKal < 0.0f) socKal = 0.0f;
+  if (socKal > 100.0f) socKal = 100.0f;
+  return socKal;
 }
 
 // === Single long battery bar with % text ===
@@ -804,7 +851,7 @@ void updateOLEDDisplay(const SensorReadings& readings) {
     display.print(headerOverlayText);
   }
 
-  // Battery bar with OCV + Coulomb SoC
+  // Battery bar with OCV + Coulomb SoC + Kalman
   float socPercent = readings.valid ? estimateSOCpct(readings.voltageV) : 0.0f;
   drawBatteryBars(socPercent);
 
@@ -834,7 +881,6 @@ void updateOLEDDisplay(const SensorReadings& readings) {
 
   display.setCursor(68, 37);
   if (readings.valid) {
-    // float powerWatt = readings.powerW;
     float powerWatt = readings.voltageV * readings.currentA;
     display.printf("P:%.2f W", powerWatt);
   } else {
