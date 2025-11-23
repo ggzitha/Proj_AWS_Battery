@@ -40,6 +40,8 @@ static float PACK_CAPACITY_Ah() {
 
 // ---- INA226 / SHUNT CONFIG ----
 bool DO_CAL = false;
+#define OLED_VltCrnt_Char 2
+
 // shunt (Ohm). Lower shunt = higher measurement range, lower resolution.
 #define SHUNT_FOR_CAL 0.00621f
 // #define SHUNT_FOR_CAL 0.0055f  // real shunt value: pararel 10 mΩ so it mustbe arround  ≈ 5 mΩ, But this use the test Calibrate use voltsRead = Volts Power SUpply & Multimeter, B \
@@ -60,10 +62,10 @@ bool DO_CAL = false;
 #define INA_V_SCALE_E4 10000
 
 // ===== User calibration offsets (apply AFTER sensor read) =====
-// B4 = 0.0f | B5 = -79.5f | B6 = -74.5f | B8 = 0.0f
-#define V_OFFSET_mV 0.0f  // e.g. +25.0f adds +25 mV to pack voltage
-// B4 = 14.0f | B5 = -31.0f | B6 = -19.0f | B8 = -98.0f
-#define I_OFFSET_mA 14.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
+// B4 = 20.5f | B5 = -79.5fNA | B6 = 24.4f | B8 = 25.0f
+#define V_OFFSET_mV 20.5f  // e.g. +25.0f adds +25 mV to pack voltage
+// B4 = -8.0f | B5 = -31.0fNA | B6 = -31.0f | B8 = -117.0f
+#define I_OFFSET_mA -8.0f  // e.g. -6.0f subtracts 6 mA Paling terakhir, abis ubah DO_CAL = true, ntar dapat ofset, habis dimasukan Ubah lagi DO_CAL = false
 
 // ===== Load compensation + smoothing (SoC under load) =====
 // LiitoKala spec: internal resistance <17 mΩ / cell
@@ -166,12 +168,12 @@ struct Kalman1D {
   bool initialized;
 
   Kalman1D()
-      : q(0.02f),  // cukup kecil biar smooth tapi masih bisa adapt
-        r(0.25f),
-        x(50.0f),
-        p(10.0f),
-        k(0.0f),
-        initialized(false) {}
+    : q(0.02f),  // cukup kecil biar smooth tapi masih bisa adapt
+      r(0.25f),
+      x(50.0f),
+      p(10.0f),
+      k(0.0f),
+      initialized(false) {}
 
   void reset(float value) {
     x = value;
@@ -716,7 +718,7 @@ static float pack_ocv_from_vi(float measuredPackVoltageV, float packCurrentA) {
   //   - To get OCV: V_ocv = V_meas - I*R (subtracting negative = adding)
   //
   // Formula is same for both: V_ocv = V_meas - I*R
-  
+
   return measuredPackVoltageV - (packCurrentA * R_PACK_OHM());
 }
 
@@ -754,7 +756,7 @@ float estimateSOCpct(float measuredPackVoltageV) {
   float packCurrentA = averagedLast.valid ? averagedLast.currentA : 0.0f;
 
   // 2) Correct measured voltage to OCV
-  float packVoltageOCV = pack_ocv_from_vi(measuredPackVoltageV, packCurrentA);  
+  float packVoltageOCV = pack_ocv_from_vi(measuredPackVoltageV, packCurrentA);
 
   // 3) Convert pack OCV to per-cell voltage
   float cellVoltageV = packVoltageOCV / SERIES_CELLS;
@@ -862,12 +864,22 @@ void updateOLEDDisplay(const SensorReadings& readings) {
 
   // Left: V / A (averaged values)
   display.setCursor(0, 25);
-  if (readings.valid) display.printf("V:%.2f V", readings.voltageV);
-  else display.print("V:--.--");
+  if (OLED_VltCrnt_Char == 2) {
+    if (readings.valid) display.printf("V:%.2f V", readings.voltageV);
+    else display.print("V:--.--");
+  } else {
+    if (readings.valid) display.printf("V:%.3fV", readings.voltageV);
+    else display.print("V:--.--");
+  }
 
   display.setCursor(0, 37);
-  if (readings.valid) display.printf("A:%.2f A", readings.currentA);
-  else display.print("A:--.--");
+  if (OLED_VltCrnt_Char == 2) {
+    if (readings.valid) display.printf("A:%.2f A", readings.currentA);
+    else display.print("A:--.--");
+  } else {
+    if (readings.valid) display.printf("A:%.3fA", readings.currentA);
+    else display.print("A:--.--");
+  }
 
   // Right: T / P
   display.setCursor(67, 25);
